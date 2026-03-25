@@ -9,7 +9,7 @@ import os
 from sklearn.metrics import confusion_matrix, f1_score
 
 # ==========================================
-# 1. Dataset Loader 
+# 1. Dataset Loader (Identical to before)
 # ==========================================
 class SaliencyTensorDataset(Dataset):
     def __init__(self, metadata_json, augment=False):
@@ -26,47 +26,78 @@ class SaliencyTensorDataset(Dataset):
 
     def __getitem__(self, idx):
         item = self.data[idx]
-        tensor = torch.load(item['fused_tensor_path']) 
+        tensor = torch.load(item['fused_tensor_path']) # Shape: [2, 224, 224]
         label = int(item['birads_label'])
         if self.augment: 
             tensor = self.transforms(tensor)
         return tensor, label
 
 # ==========================================
-# 2. The CNN Cross-Attention Grader
+# 2. Dual-Stream Vision Transformer (ViT)
 # ==========================================
-class CNNCrossAttentionGrader(nn.Module):
+class DualViewViT(nn.Module):
     def __init__(self, num_classes=6):
         super().__init__()
-        resnet = models.resnet50(weights=models.ResNet50_Weights.DEFAULT)
-        resnet.conv1 = nn.Conv2d(1, 64, kernel_size=7, stride=2, padding=3, bias=False)
-        self.feature_extractor = nn.Sequential(*list(resnet.children())[:-2])
-        embed_dim = 2048
+        
+        # 1. Load Pre-trained Vision Transformer (ViT-Base with 16x16 patches)
+        weights = models.ViT_B_16_Weights.DEFAULT
+        self.vit = models.vit_b_16(weights=weights)
+        
+        # We don't need the ViT's final classification head, just the sequence encoder
+        self.vit.heads = nn.Identity() 
+        
+        # 2. Cross-Attention Module
+        # ViT-Base has an embedding dimension of 768
+        embed_dim = 768 
         self.cross_attention = nn.MultiheadAttention(embed_dim=embed_dim, num_heads=8, batch_first=True)
-        self.global_pool = nn.AdaptiveAvgPool2d((1, 1))
+        
+        # 3. Final Ordinal Classifier Head
         self.classifier = nn.Sequential(
-            nn.Linear(embed_dim * 2, 512),
-            nn.BatchNorm1d(512),
+            nn.Linear(embed_dim * 2, 256), # CLS Token from CC + Attended CLS Token from MLO
+            nn.BatchNorm1d(256),
             nn.ReLU(),
-            nn.Dropout(0.5),
-            nn.Linear(512, num_classes - 1)
+            nn.Dropout(0.4),
+            nn.Linear(256, num_classes - 1)
         )
 
+    def extract_vit_sequence(self, x):
+        """Helper function to get the 197 patch tokens instead of just the final class prediction."""
+        # Convert 1-channel grayscale to 3-channel to utilize pre-trained RGB weights
+        x = x.repeat(1, 3, 1, 1) 
+        
+        # Process patches and add the CLS (Class) token
+        x = self.vit._process_input(x)
+        n = x.shape[0]
+        batch_class_token = self.vit.class_token.expand(n, -1, -1)
+        x = torch.cat([batch_class_token, x], dim=1)
+        
+        # Run through the Transformer Encoder [Output Shape: Batch, 197 patches, 768 features]
+        return self.vit.encoder(x)
+
     def forward(self, dual_tensor):
+        # Split the input tensor [Batch, 2, 224, 224]
         cc_img = dual_tensor[:, 0:1, :, :] 
         mlo_img = dual_tensor[:, 1:2, :, :]
-        cc_feat = self.feature_extractor(cc_img)   
-        mlo_feat = self.feature_extractor(mlo_img) 
-        B, C, H, W = cc_feat.shape
-        cc_seq = cc_feat.view(B, C, -1).permute(0, 2, 1) 
-        mlo_seq = mlo_feat.view(B, C, -1).permute(0, 2, 1)
+        
+        # 1. Extract Sequences [Batch, 197, 768]
+        cc_seq = self.extract_vit_sequence(cc_img)
+        mlo_seq = self.extract_vit_sequence(mlo_img)
+        
+        # 2. Cross Attention: CC patches query the MLO patches
+        # "If I see a spiculated patch in CC, does an MLO patch confirm it?"
         attended_mlo_seq, _ = self.cross_attention(query=cc_seq, key=mlo_seq, value=mlo_seq)
-        attended_mlo_feat = attended_mlo_seq.permute(0, 2, 1).view(B, C, H, W)
-        cc_pooled = self.global_pool(cc_feat).view(B, -1)
-        mlo_pooled = self.global_pool(attended_mlo_feat).view(B, -1)
-        fused = torch.cat([cc_pooled, mlo_pooled], dim=1)
+        
+        # 3. Extract the CLS Tokens (The 0th token summarizes the entire image sequence)
+        cc_cls = cc_seq[:, 0, :]               # [Batch, 768]
+        mlo_attended_cls = attended_mlo_seq[:, 0, :] # [Batch, 768]
+        
+        # 4. Fuse and Classify
+        fused = torch.cat([cc_cls, mlo_attended_cls], dim=1) # [Batch, 1536]
         return self.classifier(fused)
 
+# ==========================================
+# 3. Ordinal Loss & Metrics
+# ==========================================
 def ordinal_loss(predictions, targets):
     num_classes = predictions.size(1) + 1
     levels = torch.arange(num_classes - 1).to(predictions.device)
@@ -82,47 +113,45 @@ def get_metrics(model, loader, device):
             preds = (torch.sigmoid(logits) > 0.5).sum(dim=1)
             all_preds.extend(preds.cpu().numpy())
             all_labels.extend(labels.numpy())
+            
     cm = confusion_matrix(all_labels, all_preds, labels=range(6))
     f1_w = f1_score(all_labels, all_preds, average='weighted', zero_division=0)
-    return cm, f1_w
+    f1_g = f1_score(all_labels, all_preds, average=None, labels=range(6), zero_division=0)
+    return cm, f1_w, f1_g
 
 # ==========================================
-# 4. Training Loop (FIXED FOR ABLATION)
+# 4. Training Loop
 # ==========================================
 if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    meta_path = "/home/sofa/host_dir/spatial_alignment/output/saliency_metadata.json"
     
-    # Listen for current experiment folder
-    out_dir = os.getenv("RUN_OUT_DIR", "/home/sofa/host_dir/spatial_alignment/raw-4/output")
-    meta_path = os.path.join(out_dir, "saliency_metadata.json")
-    
-    if not os.path.exists(meta_path):
-        raise FileNotFoundError(f"Cannot find {meta_path}.")
-    
-    # Check if we should use augmentation
-    use_augment = os.getenv("DATA_AUGMENT", "True") == "True"
-    
-    full_dataset = SaliencyTensorDataset(meta_path, augment=use_augment)
+    # 1. Dataset & Splits
+    full_dataset = SaliencyTensorDataset(meta_path, augment=True)
     train_size = int(0.7 * len(full_dataset))
     val_size = int(0.15 * len(full_dataset))
     test_size = len(full_dataset) - train_size - val_size
-    train_ds, val_ds, test_ds = random_split(full_dataset, [train_size, val_size, test_size])
+    train_ds, val_ds, test_ds = random_split(full_dataset, [train_size, val_size, test_size], generator=torch.Generator().manual_seed(42))
 
-    # Balanced Sampling
+    # 2. Balanced Sampling
+    #train_labels = [int(full_dataset.data[i]['birads_label']) for i in train_ds.indices]
+    #class_sample_count = np.array([len(np.where(train_labels == t)[0]) for t in range(6)])
     train_labels = [int(full_dataset.data[i]['birads_label']) for i in train_ds.indices]
     class_sample_count = np.array([train_labels.count(t) for t in range(6)])
     class_sample_count = np.where(class_sample_count == 0, 1, class_sample_count)
     samples_weight = np.array([1. / class_sample_count[t] for t in train_labels])
     sampler = WeightedRandomSampler(torch.from_numpy(samples_weight).double(), len(samples_weight))
 
-    train_loader = DataLoader(train_ds, batch_size=16, sampler=sampler, drop_last=True)
+    # NOTE: ViT takes more VRAM. If you hit OOM errors, drop batch_size to 8.
+    train_loader = DataLoader(train_ds, batch_size=16, sampler=sampler)
     val_loader = DataLoader(val_ds, batch_size=16, shuffle=False)
     test_loader = DataLoader(test_ds, batch_size=16, shuffle=False)
 
-    model = CNNCrossAttentionGrader().to(device)
-    optimizer = optim.Adam(model.parameters(), lr=1e-4, weight_decay=1e-5) 
+    # 3. Initialize Model
+    model = DualViewViT().to(device)
+    optimizer = optim.Adam(model.parameters(), lr=5e-5, weight_decay=1e-5) # Slightly lower LR for ViT
 
-    print(f"--- Training CNN (Augment: {use_augment}) ---")
+    print("--- Training Dual-View ViT with Cross-Attention ---")
     for epoch in range(20):
         model.train()
         train_loss = 0
@@ -133,16 +162,11 @@ if __name__ == "__main__":
             loss.backward()
             optimizer.step()
             train_loss += loss.item()
-        _, val_f1 = get_metrics(model, val_loader, device)
+            
+        _, val_f1, _ = get_metrics(model, val_loader, device)
         print(f"Epoch {epoch+1}/20 | Loss: {train_loss/len(train_loader):.4f} | Val F1: {val_f1:.4f}")
 
-    print("\n--- Final Evaluation ---")
-    cm, f1_w = get_metrics(model, test_loader, device)
-    
-    # SAVE WEIGHTS AND METRICS FOR RUNNER
-    torch.save(model.state_dict(), os.path.join(out_dir, "cnn_attentional_weights.pth"))
-    
-    metrics_dict = {"F1_Weighted": float(f1_w), "Confusion_Matrix": cm.tolist()}
-    with open(os.path.join(out_dir, "metrics.json"), 'w') as f:
-        json.dump(metrics_dict, f, indent=4)
-    print("Run data saved successfully.")
+    print("\n--- Final Evaluation (Blind Test Set) ---")
+    cm, f1_w, f1_grades = get_metrics(model, test_loader, device)
+    print("\nConfusion Matrix:\n", cm)
+    print("\nOverall Weighted F1 Score:", f1_w)

@@ -98,17 +98,11 @@ class RawSpatialTransformer(nn.Module):
 
 class SaliencyWeightedNCC(nn.Module):
     """Novelty: Forces STN to prioritize alignment of dense breast tissue."""
-#    def __init__(self, eps=1e-5, threshold=0.3, weight=10.0):
-#        super().__init__()
-#        self.eps = eps
-#        self.threshold = threshold
-#        self.weight = weight
-    def __init__(self, eps=1e-5):
+    def __init__(self, eps=1e-5, threshold=0.3, weight=10.0):
         super().__init__()
         self.eps = eps
-        # Read from ablation runner, or default to standard
-        self.threshold = float(os.getenv("SALIENCY_THRESHOLD", "0.3"))
-        self.weight = float(os.getenv("SALIENCY_WEIGHT", "10.0"))
+        self.threshold = threshold
+        self.weight = weight
 
     def forward(self, I, J):
         I_mean = torch.mean(I, dim=[2, 3], keepdim=True)
@@ -141,14 +135,9 @@ if __name__ == "__main__":
     #out_dir = '/home/sofa/host_dir/spatial_alignment/output'
     #csv_path = '/root/host_dir/spatial_alignment/raw-4/dicom_clean_train.csv' 
     #out_dir = '/root/host_dir/spatial_alignment/raw-4/output'
-    #csv_path = '/home/sofa/host_dir/spatial_alignment/raw-4/dicom_clean_train.csv' 
-    #out_dir = '/home/sofa/host_dir/spatial_alignment/raw-4/output'
-    #tensor_dir = os.path.join(out_dir, 'fused_saliency_tensors')
     csv_path = '/home/sofa/host_dir/spatial_alignment/raw-4/dicom_clean_train.csv' 
-    # Read output dir from runner, or default to normal output folder
-    out_dir = os.getenv("RUN_OUT_DIR", "/home/sofa/host_dir/spatial_alignment/raw-4/output")
+    out_dir = '/home/sofa/host_dir/spatial_alignment/raw-4/output'
     tensor_dir = os.path.join(out_dir, 'fused_saliency_tensors')
-    os.makedirs(tensor_dir, exist_ok=True)
     os.makedirs(tensor_dir, exist_ok=True)
 
     dataset = DualViewMammogramDataset(csv_file=csv_path)

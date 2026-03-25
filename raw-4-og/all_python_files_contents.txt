@@ -78,38 +78,17 @@ class RawSpatialTransformer(nn.Module):
         x = torch.cat([cc_view, mlo_view], dim=1)
         xs = self.localization(x).view(-1, 32 * 7 * 7)
         theta = self.fc_loc(xs).view(-1, 2, 3)
-        
-        # --- ANTI-COLLAPSE CONSTRAINTS ---
-        # Stop the STN from squishing the image into a tiny dot
-        theta_constrained = theta.clone()
-        theta_constrained[:, 0, 0] = torch.clamp(theta[:, 0, 0], min=0.8, max=1.2) 
-        theta_constrained[:, 1, 1] = torch.clamp(theta[:, 1, 1], min=0.8, max=1.2) 
-        
-        grid = F.affine_grid(theta_constrained, mlo_view.size(), align_corners=True)
+        grid = F.affine_grid(theta, mlo_view.size(), align_corners=True)
         aligned_mlo = F.grid_sample(mlo_view, grid, align_corners=True)
-        return aligned_mlo, theta_constrained
-
-#    def forward(self, cc_view, mlo_view):
-#        x = torch.cat([cc_view, mlo_view], dim=1)
-#        xs = self.localization(x).view(-1, 32 * 7 * 7)
-##        theta = self.fc_loc(xs).view(-1, 2, 3)
-#       grid = F.affine_grid(theta, mlo_view.size(), align_corners=True)
-#        aligned_mlo = F.grid_sample(mlo_view, grid, align_corners=True)
-#        return aligned_mlo, theta
+        return aligned_mlo, theta
 
 class SaliencyWeightedNCC(nn.Module):
     """Novelty: Forces STN to prioritize alignment of dense breast tissue."""
-#    def __init__(self, eps=1e-5, threshold=0.3, weight=10.0):
-#        super().__init__()
-#        self.eps = eps
-#        self.threshold = threshold
-#        self.weight = weight
-    def __init__(self, eps=1e-5):
+    def __init__(self, eps=1e-5, threshold=0.3, weight=10.0):
         super().__init__()
         self.eps = eps
-        # Read from ablation runner, or default to standard
-        self.threshold = float(os.getenv("SALIENCY_THRESHOLD", "0.3"))
-        self.weight = float(os.getenv("SALIENCY_WEIGHT", "10.0"))
+        self.threshold = threshold
+        self.weight = weight
 
     def forward(self, I, J):
         I_mean = torch.mean(I, dim=[2, 3], keepdim=True)
@@ -142,14 +121,9 @@ if __name__ == "__main__":
     #out_dir = '/home/sofa/host_dir/spatial_alignment/output'
     #csv_path = '/root/host_dir/spatial_alignment/raw-4/dicom_clean_train.csv' 
     #out_dir = '/root/host_dir/spatial_alignment/raw-4/output'
-    #csv_path = '/home/sofa/host_dir/spatial_alignment/raw-4/dicom_clean_train.csv' 
-    #out_dir = '/home/sofa/host_dir/spatial_alignment/raw-4/output'
-    #tensor_dir = os.path.join(out_dir, 'fused_saliency_tensors')
     csv_path = '/home/sofa/host_dir/spatial_alignment/raw-4/dicom_clean_train.csv' 
-    # Read output dir from runner, or default to normal output folder
-    out_dir = os.getenv("RUN_OUT_DIR", "/home/sofa/host_dir/spatial_alignment/raw-4/output")
+    out_dir = '/home/sofa/host_dir/spatial_alignment/raw-4/output'
     tensor_dir = os.path.join(out_dir, 'fused_saliency_tensors')
-    os.makedirs(tensor_dir, exist_ok=True)
     os.makedirs(tensor_dir, exist_ok=True)
 
     dataset = DualViewMammogramDataset(csv_file=csv_path)
@@ -231,7 +205,7 @@ class SaliencyTensorDataset(Dataset):
 
     def __getitem__(self, idx):
         item = self.data[idx]
-        tensor = torch.load(item['fused_tensor_path']) 
+        tensor = torch.load(item['fused_tensor_path']) # Shape: [2, 224, 224]
         label = int(item['birads_label'])
         if self.augment: 
             tensor = self.transforms(tensor)
@@ -243,35 +217,63 @@ class SaliencyTensorDataset(Dataset):
 class CNNCrossAttentionGrader(nn.Module):
     def __init__(self, num_classes=6):
         super().__init__()
+        
+        # 1. The CNN Feature Extractor (ResNet-50)
         resnet = models.resnet50(weights=models.ResNet50_Weights.DEFAULT)
+        
+        # Modify the first layer to accept 1-channel grayscale (Mammogram)
         resnet.conv1 = nn.Conv2d(1, 64, kernel_size=7, stride=2, padding=3, bias=False)
+        
+        # Strip the classification head and global pooling layer.
+        # We want the raw spatial feature maps (Shape will be [Batch, 2048, 7, 7])
         self.feature_extractor = nn.Sequential(*list(resnet.children())[:-2])
+        
+        # 2. The Cross-Attention Module
+        # ResNet50 outputs 2048 channels.
         embed_dim = 2048
         self.cross_attention = nn.MultiheadAttention(embed_dim=embed_dim, num_heads=8, batch_first=True)
+        
+        # 3. The Ordinal Classifier
         self.global_pool = nn.AdaptiveAvgPool2d((1, 1))
         self.classifier = nn.Sequential(
-            nn.Linear(embed_dim * 2, 512),
+            nn.Linear(embed_dim * 2, 512), # CC + Attended MLO
             nn.BatchNorm1d(512),
             nn.ReLU(),
-            nn.Dropout(0.5),
+            nn.Dropout(0.5), # Strong dropout to prevent overfitting
             nn.Linear(512, num_classes - 1)
         )
 
     def forward(self, dual_tensor):
+        # dual_tensor shape: [Batch, 2, 224, 224]
         cc_img = dual_tensor[:, 0:1, :, :] 
         mlo_img = dual_tensor[:, 1:2, :, :]
+        
+        # 1. Extract Spatial Feature Maps using CNN
         cc_feat = self.feature_extractor(cc_img)   
         mlo_feat = self.feature_extractor(mlo_img) 
+        
         B, C, H, W = cc_feat.shape
+        
+        # 2. Prepare for Attention (Flatten spatial dimensions 7x7 -> 49 sequence length)
         cc_seq = cc_feat.view(B, C, -1).permute(0, 2, 1) 
         mlo_seq = mlo_feat.view(B, C, -1).permute(0, 2, 1)
+        
+        # 3. Cross-Attention
         attended_mlo_seq, _ = self.cross_attention(query=cc_seq, key=mlo_seq, value=mlo_seq)
+        
+        # 4. Reshape back to image dimensions and Pool
         attended_mlo_feat = attended_mlo_seq.permute(0, 2, 1).view(B, C, H, W)
+        
         cc_pooled = self.global_pool(cc_feat).view(B, -1)
         mlo_pooled = self.global_pool(attended_mlo_feat).view(B, -1)
+        
+        # 5. Fuse and Classify
         fused = torch.cat([cc_pooled, mlo_pooled], dim=1)
         return self.classifier(fused)
 
+# ==========================================
+# 3. Ordinal Loss & Metrics
+# ==========================================
 def ordinal_loss(predictions, targets):
     num_classes = predictions.size(1) + 1
     levels = torch.arange(num_classes - 1).to(predictions.device)
@@ -287,47 +289,48 @@ def get_metrics(model, loader, device):
             preds = (torch.sigmoid(logits) > 0.5).sum(dim=1)
             all_preds.extend(preds.cpu().numpy())
             all_labels.extend(labels.numpy())
+            
     cm = confusion_matrix(all_labels, all_preds, labels=range(6))
     f1_w = f1_score(all_labels, all_preds, average='weighted', zero_division=0)
-    return cm, f1_w
+    f1_g = f1_score(all_labels, all_preds, average=None, labels=range(6), zero_division=0)
+    return cm, f1_w, f1_g
 
 # ==========================================
-# 4. Training Loop (FIXED FOR ABLATION)
+# 4. Training Loop
 # ==========================================
 if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
-    # Listen for current experiment folder
-    out_dir = os.getenv("RUN_OUT_DIR", "/home/sofa/host_dir/spatial_alignment/raw-4/output")
-    meta_path = os.path.join(out_dir, "saliency_metadata.json")
+    # CORRECTED PATH FOR YOUR ENVIRONMENT
+    meta_path = "/home/host_dir/spatial_alignment/raw-4/output/saliency_metadata.json"
     
     if not os.path.exists(meta_path):
-        raise FileNotFoundError(f"Cannot find {meta_path}.")
+        raise FileNotFoundError(f"Cannot find {meta_path}. Did you run 1_train_saliency_affine.py first?")
     
-    # Check if we should use augmentation
-    use_augment = os.getenv("DATA_AUGMENT", "True") == "True"
-    
-    full_dataset = SaliencyTensorDataset(meta_path, augment=use_augment)
+    # 1. Dataset & Splits
+    full_dataset = SaliencyTensorDataset(meta_path, augment=True)
     train_size = int(0.7 * len(full_dataset))
     val_size = int(0.15 * len(full_dataset))
     test_size = len(full_dataset) - train_size - val_size
-    train_ds, val_ds, test_ds = random_split(full_dataset, [train_size, val_size, test_size])
+    train_ds, val_ds, test_ds = random_split(full_dataset, [train_size, val_size, test_size], generator=torch.Generator().manual_seed(42))
 
-    # Balanced Sampling
+    # 2. Balanced Sampling
     train_labels = [int(full_dataset.data[i]['birads_label']) for i in train_ds.indices]
     class_sample_count = np.array([train_labels.count(t) for t in range(6)])
     class_sample_count = np.where(class_sample_count == 0, 1, class_sample_count)
     samples_weight = np.array([1. / class_sample_count[t] for t in train_labels])
     sampler = WeightedRandomSampler(torch.from_numpy(samples_weight).double(), len(samples_weight))
 
-    train_loader = DataLoader(train_ds, batch_size=16, sampler=sampler, drop_last=True)
+    # Batch size set to 16. If you get CUDA Out of Memory, drop this to 8 or 4.
+    train_loader = DataLoader(train_ds, batch_size=16, sampler=sampler)
     val_loader = DataLoader(val_ds, batch_size=16, shuffle=False)
     test_loader = DataLoader(test_ds, batch_size=16, shuffle=False)
 
+    # 3. Initialize Model
     model = CNNCrossAttentionGrader().to(device)
     optimizer = optim.Adam(model.parameters(), lr=1e-4, weight_decay=1e-5) 
 
-    print(f"--- Training CNN (Augment: {use_augment}) ---")
+    print("--- Training CNN ResNet50 with Cross-Attention ---")
     for epoch in range(20):
         model.train()
         train_loss = 0
@@ -338,19 +341,18 @@ if __name__ == "__main__":
             loss.backward()
             optimizer.step()
             train_loss += loss.item()
-        _, val_f1 = get_metrics(model, val_loader, device)
+            
+        _, val_f1, _ = get_metrics(model, val_loader, device)
         print(f"Epoch {epoch+1}/20 | Loss: {train_loss/len(train_loader):.4f} | Val F1: {val_f1:.4f}")
 
-    print("\n--- Final Evaluation ---")
-    cm, f1_w = get_metrics(model, test_loader, device)
+    print("\n--- Final Evaluation (Blind Test Set) ---")
+    cm, f1_w, f1_grades = get_metrics(model, test_loader, device)
+    print("\nConfusion Matrix:\n", cm)
+    print("\nOverall Weighted F1 Score:", f1_w)
     
-    # SAVE WEIGHTS AND METRICS FOR RUNNER
-    torch.save(model.state_dict(), os.path.join(out_dir, "cnn_attentional_weights.pth"))
-    
-    metrics_dict = {"F1_Weighted": float(f1_w), "Confusion_Matrix": cm.tolist()}
-    with open(os.path.join(out_dir, "metrics.json"), 'w') as f:
-        json.dump(metrics_dict, f, indent=4)
-    print("Run data saved successfully.")
+    # Save the weights so you can use them in visualization later if you want
+    torch.save(model.state_dict(), "/home/host_dir/spatial_alignment/raw-4/output/cnn_attentional_weights.pth")
+    print("Model weights saved.")
 
 
 3_visualize_pipeline.py
@@ -362,77 +364,125 @@ import numpy as np
 import os
 import cv2
 import matplotlib
-matplotlib.use('Agg') 
+matplotlib.use('Agg') # For headless SSH/Docker environments
 import matplotlib.pyplot as plt
+
+# Import your model from the previous script (ensure the file is named correctly)
+# If you didn't save it in a module, you can just paste the DualViewViT class here.
 from torchvision import models
 
-class CNN_Visualizer(nn.Module):
+class DualViewViT_Visualizer(nn.Module):
+    """A modified version of your ViT that returns the Attention Maps"""
     def __init__(self, num_classes=6):
         super().__init__()
-        resnet = models.resnet50(weights=models.ResNet50_Weights.DEFAULT)
-        resnet.conv1 = nn.Conv2d(1, 64, kernel_size=7, stride=2, padding=3, bias=False)
-        self.feature_extractor = nn.Sequential(*list(resnet.children())[:-2])
-        self.cross_attention = nn.MultiheadAttention(embed_dim=2048, num_heads=8, batch_first=True)
+        weights = models.ViT_B_16_Weights.DEFAULT
+        self.vit = models.vit_b_16(weights=weights)
+        self.vit.heads = nn.Identity() 
+        self.cross_attention = nn.MultiheadAttention(embed_dim=768, num_heads=8, batch_first=True)
+        self.classifier = nn.Linear(768 * 2, num_classes - 1)
+
+    def extract_vit_sequence(self, x):
+        x = x.repeat(1, 3, 1, 1) 
+        x = self.vit._process_input(x)
+        n = x.shape[0]
+        batch_class_token = self.vit.class_token.expand(n, -1, -1)
+        x = torch.cat([batch_class_token, x], dim=1)
+        return self.vit.encoder(x)
 
     def forward(self, dual_tensor):
         cc_img = dual_tensor[:, 0:1, :, :] 
         mlo_img = dual_tensor[:, 1:2, :, :]
-        cc_feat = self.feature_extractor(cc_img)   
-        mlo_feat = self.feature_extractor(mlo_img) 
-        B, C, H, W = cc_feat.shape
-        cc_seq = cc_feat.view(B, C, -1).permute(0, 2, 1) 
-        mlo_seq = mlo_feat.view(B, C, -1).permute(0, 2, 1)
-        _, attn_weights = self.cross_attention(query=cc_seq, key=mlo_seq, value=mlo_seq, need_weights=True)
+        
+        cc_seq = self.extract_vit_sequence(cc_img)
+        mlo_seq = self.extract_vit_sequence(mlo_img)
+        
+        # CRITICAL CHANGE: We ask PyTorch to return the raw attention weights
+        attended_mlo_seq, attn_weights = self.cross_attention(
+            query=cc_seq, key=mlo_seq, value=mlo_seq, need_weights=True
+        )
         return attn_weights
 
 def generate_visual_diagnostics(metadata_path, model_weights_path, num_samples=3):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    out_dir = os.path.join(os.path.dirname(metadata_path), "diagnostics")
+    out_dir = "/home/sofa/host_dir/spatial_alignment/raw-4/output/diagnostics"
     os.makedirs(out_dir, exist_ok=True)
 
-    model = CNN_Visualizer().to(device)
+    # 1. Load the Model (Optional: If you haven't trained it yet, it will just show untrained attention)
+    model = DualViewViT_Visualizer().to(device)
     if os.path.exists(model_weights_path):
+        # Allow missing keys because we skipped the Sequential wrapper in the visualizer
         model.load_state_dict(torch.load(model_weights_path, map_location=device), strict=False)
     model.eval()
 
+    # 2. Load Metadata
     with open(metadata_path, 'r') as f:
         metadata = json.load(f)
     samples = random.sample(metadata, min(num_samples, len(metadata)))
 
+    print(f"Generating Diagnostics for {len(samples)} patients...")
+
     for i, item in enumerate(samples):
         if not os.path.exists(item['fused_tensor_path']): continue
+        
+        # Load Tensor: [2, 224, 224]
         tensor = torch.load(item['fused_tensor_path']).unsqueeze(0).to(device)
-        cc_view, mlo_view = tensor[0, 0].cpu().numpy(), tensor[0, 1].cpu().numpy()
+        cc_view = tensor[0, 0].cpu().numpy()
+        mlo_view = tensor[0, 1].cpu().numpy()
 
+        # --- A. Generate Saliency Mask (Threshold = 0.3) ---
+        cc_norm = (cc_view - cc_view.min()) / (cc_view.max() - cc_view.min() + 1e-5)
+        saliency_mask = cc_norm > 0.3
+
+        # --- B. Get ViT Attention Map ---
         with torch.no_grad():
+            # attn_weights shape: [Batch, Seq_Len_Q, Seq_Len_K] -> [1, 197, 197]
             attn_weights = model(tensor)
-            global_mlo_attention = attn_weights[0].mean(dim=0).cpu().numpy().reshape(7, 7)
-            attention_heatmap = cv2.resize(global_mlo_attention, (224, 224))
+            
+            # We want to see where the CC's "Class Token" (index 0) is looking in the MLO image (indices 1 to 196)
+            # ViT-Base uses 16x16 patches, so 224/16 = 14. The grid is 14x14.
+            cls_attention = attn_weights[0, 0, 1:].cpu().numpy().reshape(14, 14)
+            
+            # Resize the 14x14 heatmap back to 224x224 to overlay on the image
+            attention_heatmap = cv2.resize(cls_attention, (224, 224), interpolation=cv2.INTER_CUBIC)
+            attention_heatmap = (attention_heatmap - attention_heatmap.min()) / (attention_heatmap.max() - attention_heatmap.min())
 
+        # --- C. Plotting ---
         fig, axes = plt.subplots(1, 4, figsize=(20, 5))
+        
+        # Panel 1: Original CC Target
         axes[0].imshow(cc_view, cmap='gray')
-        axes[0].set_title(f"Target: CC View\nBI-RADS: {item['birads_label']}")
-        axes[1].imshow(cc_view, cmap='gray') # Mask panel skipped here for simplicity
+        axes[0].set_title(f"Target: CC View\nTrue BI-RADS: {item['birads_label']}")
+        
+        # Panel 2: Saliency Prioritization
+        axes[1].imshow(cc_view, cmap='gray')
+        axes[1].imshow(saliency_mask, cmap='YlOrRd', alpha=0.4)
+        axes[1].set_title("Affine Saliency Mask\n(Bright Tissue Targeted)")
+        
+        # Panel 3: Affine Structural Overlay
         axes[2].imshow(cc_view, cmap='Reds', alpha=0.5)
         axes[2].imshow(mlo_view, cmap='Blues', alpha=0.5)
-        axes[2].set_title("STN Aligned Overlay")
+        axes[2].set_title("Saliency-Aligned Overlay\n(Purple = Overlap)")
+
+        # Panel 4: Transformer Attention
         axes[3].imshow(mlo_view, cmap='gray')
-        axes[3].imshow(attention_heatmap, cmap='jet', alpha=0.5)
-        axes[3].set_title("CNN Cross-Attention")
+        # Overlay the attention heatmap using the "jet" colormap
+        im = axes[3].imshow(attention_heatmap, cmap='jet', alpha=0.5)
+        axes[3].set_title("ViT Cross-Attention\n(Where the model is looking)")
         
         for ax in axes: ax.axis('off')
+        
+        save_path = f"{out_dir}/diagnostic_patient_{i+1}.png"
         plt.tight_layout()
-        plt.savefig(f"{out_dir}/patient_{i+1}.png")
+        plt.savefig(save_path)
         plt.close()
-    print(f"Diagnostics saved to {out_dir}")
+        print(f"Saved: {save_path}")
 
 if __name__ == "__main__":
-    # Get dynamic output directory from runner
-    out_dir = os.getenv("RUN_OUT_DIR", "/home/sofa/host_dir/spatial_alignment/raw-4/output")
-    generate_visual_diagnostics(
-        os.path.join(out_dir, "saliency_metadata.json"), 
-        os.path.join(out_dir, "cnn_attentional_weights.pth")
-    )
+    # Update this path if you named your saved weights file differently in Step 2
+    weights_path = "/home/sofa/host_dir/spatial_alignment/raw-4/output/vit_attentional_weights.pth"
+    meta_path = "/home/sofa/host_dir/spatial_alignment/raw-4/output/saliency_metadata.json"
+    
+    generate_visual_diagnostics(meta_path, weights_path)
 
 
 DEPRECATED_2_train_vit_attentional.py
@@ -690,71 +740,6 @@ def generate_paired_manifest():
 
 if __name__ == "__main__":
     generate_paired_manifest()
-
-
-check_model.py
-import os
-import torch
-import pandas as pd
-from PIL import Image
-import importlib.util
-import sys
-
-def dynamic_import(name, path):
-    spec = importlib.util.spec_from_file_location(name, path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[name] = module
-    spec.loader.exec_module(module)
-    return module
-
-BASE_DIR = '/home/sofa/host_dir/spatial_alignment/raw-4'
-script1_path = os.path.join(BASE_DIR, '1_train_saliency_affine.py')
-script2_path = os.path.join(BASE_DIR, '2_train_crossattention_grader.py')
-script3_path = os.path.join(BASE_DIR, '3_visualize_pipeline.py')
-
-try:
-    stn_mod = dynamic_import("script1", script1_path)
-    grader_mod = dynamic_import("script2", script2_path)
-    viz_mod = dynamic_import("script3", script3_path)
-except Exception as e:
-    print(f"❌ Load Error: {e}")
-    sys.exit(1)
-
-def run_checks():
-    print("="*60)
-    print("🔍 PRE-FLIGHT VALIDATION (FIXED)")
-    print("="*60)
-
-    device = torch.device("cpu")
-    
-    try:
-        # 1. Check STN
-        stn = stn_mod.RawSpatialTransformer().to(device)
-        stn.eval() # <--- CRITICAL FIX
-        dummy_cc = torch.randn(1, 1, 224, 224)
-        dummy_mlo = torch.randn(1, 1, 224, 224)
-        aligned, theta = stn(dummy_cc, dummy_mlo)
-        print(f"✅ STN Initialized. Output Shape: {aligned.shape}")
-        
-        # 2. Check Grader
-        grader = grader_mod.CNNCrossAttentionGrader().to(device)
-        grader.eval() # <--- CRITICAL FIX: BatchNorm won't crash with size 1 now
-        dummy_fused = torch.randn(1, 2, 224, 224)
-        logits = grader(dummy_fused)
-        print(f"✅ Grader Initialized. Logits Shape: {logits.shape}")
-        
-        # 3. Check Visualizer
-        visualizer = viz_mod.CNN_Visualizer().to(device)
-        visualizer.eval() # <--- CRITICAL FIX
-        attn = visualizer(dummy_fused)
-        print(f"✅ Visualizer Initialized. Attention Map Shape: {attn.shape}")
-        
-        print("\n🚀 ALL SYSTEMS NOMINAL. VALIDATION PASSED.")
-    except Exception as e:
-        print(f"❌ ERROR: Architecture mismatch found! Error: {e}")
-
-if __name__ == "__main__":
-    run_checks()
 
 
 dataset_report.py
@@ -1216,88 +1201,3 @@ with output_file.open("w", encoding="utf-8") as out:
             out.write("\n\n\n")
 
 print(f"Saved to: {output_file}")
-
-
-
-runall.py
-import os
-import subprocess
-import sys
-import json
-import pandas as pd
-from datetime import datetime
-
-python_exec = "/home/sofa/miniconda3/envs/phy/bin/python"
-base_dir = "/home/sofa/host_dir/spatial_alignment/raw-4"
-master_output_dir = os.path.join(base_dir, "ablation_studies")
-
-# Define the Ablation Experiments
-experiments = [
-    {"name": "01_Baseline_Full_Pipeline", "weight": "10.0", "threshold": "0.3", "augment": "True"},
-    {"name": "02_No_Saliency_Weighting", "weight": "0.0", "threshold": "0.3", "augment": "True"},
-    {"name": "03_Hyper_Saliency", "weight": "25.0", "threshold": "0.3", "augment": "True"},
-    {"name": "04_Low_Threshold", "weight": "10.0", "threshold": "0.1", "augment": "True"},
-    {"name": "05_No_Data_Augmentation", "weight": "10.0", "threshold": "0.3", "augment": "False"},
-]
-
-scripts = [
-    "1_train_saliency_affine.py",
-    "2_train_crossattention_grader.py",
-    "3_visualize_pipeline.py"
-]
-
-os.makedirs(master_output_dir, exist_ok=True)
-master_results = []
-
-print(f"🚀 Starting 10-Hour Ablation Study: {len(experiments)} Runs Scheduled.\n")
-
-for exp in experiments:
-    run_dir = os.path.join(master_output_dir, exp["name"])
-    os.makedirs(run_dir, exist_ok=True)
-    
-    print("="*60)
-    print(f"🧪 INITIATING RUN: {exp['name']}")
-    print(f"📁 Output Directory: {run_dir}")
-    print("="*60)
-    
-    # Set Environment Variables for the child scripts to read
-    env = os.environ.copy()
-    env["RUN_OUT_DIR"] = run_dir
-    env["SALIENCY_WEIGHT"] = exp["weight"]
-    env["SALIENCY_THRESHOLD"] = exp["threshold"]
-    env["DATA_AUGMENT"] = exp["augment"]
-    
-    run_failed = False
-    
-    for script in scripts:
-        print(f"   -> Executing {script}...")
-        script_path = os.path.join(base_dir, script)
-        
-        result = subprocess.run([python_exec, script_path], env=env)
-        
-        if result.returncode != 0:
-            print(f"\n❌ ERROR: {script} failed during {exp['name']}! Skipping to next experiment.")
-            run_failed = True
-            break # Break out of the scripts loop and move to the next experiment
-            
-    if not run_failed:
-        # Read the metrics dumped by script 2
-        metrics_file = os.path.join(run_dir, "metrics.json")
-        if os.path.exists(metrics_file):
-            with open(metrics_file, 'r') as f:
-                metrics = json.load(f)
-                
-            # Combine config and results for the master CSV
-            row = {**exp, **metrics}
-            master_results.append(row)
-            print(f"✅ Run {exp['name']} Completed. F1 Score: {metrics.get('F1_Weighted', 'N/A')}\n")
-
-# Wrap up and save Master CSV
-if master_results:
-    df = pd.DataFrame(master_results)
-    csv_path = os.path.join(master_output_dir, f"master_ablation_results_{datetime.now().strftime('%Y%m%d_%H%M')}.csv")
-    df.to_csv(csv_path, index=False)
-    print("="*60)
-    print("🎉 ABLATION STUDY COMPLETE!")
-    print(f"📊 Results compiled and saved to: {csv_path}")
-    print("="*60)
