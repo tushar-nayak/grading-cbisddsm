@@ -1,2 +1,2 @@
 dataset/
-output/
+*.pth
