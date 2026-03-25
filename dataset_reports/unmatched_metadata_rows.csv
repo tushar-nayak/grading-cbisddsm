@@ -1,0 +1,1 @@
+patient_id,breast_density,left or right breast,image view,abnormality id,abnormality type,mass shape,mass margins,assessment,pathology,subtlety,image file path,cropped image file path,ROI mask file path,source_csv,breast density,calc type,calc distribution,jpg_path,jpg_found

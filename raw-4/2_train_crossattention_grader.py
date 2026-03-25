@@ -9,7 +9,7 @@ import os
 from sklearn.metrics import confusion_matrix, f1_score
 
 # ==========================================
-# 1. Dataset Loader (Identical to before)
+# 1. Dataset Loader 
 # ==========================================
 class SaliencyTensorDataset(Dataset):
     def __init__(self, metadata_json, augment=False):
@@ -33,66 +33,63 @@ class SaliencyTensorDataset(Dataset):
         return tensor, label
 
 # ==========================================
-# 2. Dual-Stream Vision Transformer (ViT)
+# 2. The CNN Cross-Attention Grader
 # ==========================================
-class DualViewViT(nn.Module):
+class CNNCrossAttentionGrader(nn.Module):
     def __init__(self, num_classes=6):
         super().__init__()
         
-        # 1. Load Pre-trained Vision Transformer (ViT-Base with 16x16 patches)
-        weights = models.ViT_B_16_Weights.DEFAULT
-        self.vit = models.vit_b_16(weights=weights)
+        # 1. The CNN Feature Extractor (ResNet-50)
+        resnet = models.resnet50(weights=models.ResNet50_Weights.DEFAULT)
         
-        # We don't need the ViT's final classification head, just the sequence encoder
-        self.vit.heads = nn.Identity() 
+        # Modify the first layer to accept 1-channel grayscale (Mammogram)
+        resnet.conv1 = nn.Conv2d(1, 64, kernel_size=7, stride=2, padding=3, bias=False)
         
-        # 2. Cross-Attention Module
-        # ViT-Base has an embedding dimension of 768
-        embed_dim = 768 
+        # Strip the classification head and global pooling layer.
+        # We want the raw spatial feature maps (Shape will be [Batch, 2048, 7, 7])
+        self.feature_extractor = nn.Sequential(*list(resnet.children())[:-2])
+        
+        # 2. The Cross-Attention Module
+        # ResNet50 outputs 2048 channels.
+        embed_dim = 2048
         self.cross_attention = nn.MultiheadAttention(embed_dim=embed_dim, num_heads=8, batch_first=True)
         
-        # 3. Final Ordinal Classifier Head
+        # 3. The Ordinal Classifier
+        self.global_pool = nn.AdaptiveAvgPool2d((1, 1))
         self.classifier = nn.Sequential(
-            nn.Linear(embed_dim * 2, 256), # CLS Token from CC + Attended CLS Token from MLO
-            nn.BatchNorm1d(256),
+            nn.Linear(embed_dim * 2, 512), # CC + Attended MLO
+            nn.BatchNorm1d(512),
             nn.ReLU(),
-            nn.Dropout(0.4),
-            nn.Linear(256, num_classes - 1)
+            nn.Dropout(0.5), # Strong dropout to prevent overfitting
+            nn.Linear(512, num_classes - 1)
         )
 
-    def extract_vit_sequence(self, x):
-        """Helper function to get the 197 patch tokens instead of just the final class prediction."""
-        # Convert 1-channel grayscale to 3-channel to utilize pre-trained RGB weights
-        x = x.repeat(1, 3, 1, 1) 
-        
-        # Process patches and add the CLS (Class) token
-        x = self.vit._process_input(x)
-        n = x.shape[0]
-        batch_class_token = self.vit.class_token.expand(n, -1, -1)
-        x = torch.cat([batch_class_token, x], dim=1)
-        
-        # Run through the Transformer Encoder [Output Shape: Batch, 197 patches, 768 features]
-        return self.vit.encoder(x)
-
     def forward(self, dual_tensor):
-        # Split the input tensor [Batch, 2, 224, 224]
+        # dual_tensor shape: [Batch, 2, 224, 224]
         cc_img = dual_tensor[:, 0:1, :, :] 
         mlo_img = dual_tensor[:, 1:2, :, :]
         
-        # 1. Extract Sequences [Batch, 197, 768]
-        cc_seq = self.extract_vit_sequence(cc_img)
-        mlo_seq = self.extract_vit_sequence(mlo_img)
+        # 1. Extract Spatial Feature Maps using CNN
+        cc_feat = self.feature_extractor(cc_img)   
+        mlo_feat = self.feature_extractor(mlo_img) 
         
-        # 2. Cross Attention: CC patches query the MLO patches
-        # "If I see a spiculated patch in CC, does an MLO patch confirm it?"
+        B, C, H, W = cc_feat.shape
+        
+        # 2. Prepare for Attention (Flatten spatial dimensions 7x7 -> 49 sequence length)
+        cc_seq = cc_feat.view(B, C, -1).permute(0, 2, 1) 
+        mlo_seq = mlo_feat.view(B, C, -1).permute(0, 2, 1)
+        
+        # 3. Cross-Attention
         attended_mlo_seq, _ = self.cross_attention(query=cc_seq, key=mlo_seq, value=mlo_seq)
         
-        # 3. Extract the CLS Tokens (The 0th token summarizes the entire image sequence)
-        cc_cls = cc_seq[:, 0, :]               # [Batch, 768]
-        mlo_attended_cls = attended_mlo_seq[:, 0, :] # [Batch, 768]
+        # 4. Reshape back to image dimensions and Pool
+        attended_mlo_feat = attended_mlo_seq.permute(0, 2, 1).view(B, C, H, W)
         
-        # 4. Fuse and Classify
-        fused = torch.cat([cc_cls, mlo_attended_cls], dim=1) # [Batch, 1536]
+        cc_pooled = self.global_pool(cc_feat).view(B, -1)
+        mlo_pooled = self.global_pool(attended_mlo_feat).view(B, -1)
+        
+        # 5. Fuse and Classify
+        fused = torch.cat([cc_pooled, mlo_pooled], dim=1)
         return self.classifier(fused)
 
 # ==========================================
@@ -124,7 +121,12 @@ def get_metrics(model, loader, device):
 # ==========================================
 if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    meta_path = "/home/sofa/host_dir/spatial_alignment/output/saliency_metadata.json"
+    
+    # CORRECTED PATH FOR YOUR ENVIRONMENT
+    meta_path = "/home/host_dir/spatial_alignment/raw-4/output/saliency_metadata.json"
+    
+    if not os.path.exists(meta_path):
+        raise FileNotFoundError(f"Cannot find {meta_path}. Did you run 1_train_saliency_affine.py first?")
     
     # 1. Dataset & Splits
     full_dataset = SaliencyTensorDataset(meta_path, augment=True)
@@ -135,21 +137,21 @@ if __name__ == "__main__":
 
     # 2. Balanced Sampling
     train_labels = [int(full_dataset.data[i]['birads_label']) for i in train_ds.indices]
-    class_sample_count = np.array([len(np.where(train_labels == t)[0]) for t in range(6)])
+    class_sample_count = np.array([train_labels.count(t) for t in range(6)])
     class_sample_count = np.where(class_sample_count == 0, 1, class_sample_count)
     samples_weight = np.array([1. / class_sample_count[t] for t in train_labels])
     sampler = WeightedRandomSampler(torch.from_numpy(samples_weight).double(), len(samples_weight))
 
-    # NOTE: ViT takes more VRAM. If you hit OOM errors, drop batch_size to 8.
+    # Batch size set to 16. If you get CUDA Out of Memory, drop this to 8 or 4.
     train_loader = DataLoader(train_ds, batch_size=16, sampler=sampler)
     val_loader = DataLoader(val_ds, batch_size=16, shuffle=False)
     test_loader = DataLoader(test_ds, batch_size=16, shuffle=False)
 
     # 3. Initialize Model
-    model = DualViewViT().to(device)
-    optimizer = optim.Adam(model.parameters(), lr=5e-5, weight_decay=1e-5) # Slightly lower LR for ViT
+    model = CNNCrossAttentionGrader().to(device)
+    optimizer = optim.Adam(model.parameters(), lr=1e-4, weight_decay=1e-5) 
 
-    print("--- Training Dual-View ViT with Cross-Attention ---")
+    print("--- Training CNN ResNet50 with Cross-Attention ---")
     for epoch in range(20):
         model.train()
         train_loss = 0
@@ -168,3 +170,7 @@ if __name__ == "__main__":
     cm, f1_w, f1_grades = get_metrics(model, test_loader, device)
     print("\nConfusion Matrix:\n", cm)
     print("\nOverall Weighted F1 Score:", f1_w)
+    
+    # Save the weights so you can use them in visualization later if you want
+    torch.save(model.state_dict(), "/home/host_dir/spatial_alignment/raw-4/output/cnn_attentional_weights.pth")
+    print("Model weights saved.")
