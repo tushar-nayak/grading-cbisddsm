@@ -25,7 +25,7 @@ cnn_attentional_weights.pth
 dataset_reports/
 output/diagnostics/
 *.png
-all_python_files_contents.txt
+#all_python_files_contents.txt
 dicom_clean_train.csv
 saliency_metadata.json
 
