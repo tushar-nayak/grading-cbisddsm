@@ -6,12 +6,20 @@ from pathlib import Path
 import numpy as np
 from PIL import Image, ImageDraw
 
-from .alignment import align_mlo_to_cc
-from .classification import BiradsClassifier
-from .correspondence import compute_cross_view_correspondence
-from .data import ManifestLoader, load_view_data
-from .detection import detect_lesion_bbox
-from .segmentation import segment_lesion
+try:
+    from .alignment import align_mlo_to_cc
+    from .classification import BiradsClassifier
+    from .correspondence import compute_cross_view_correspondence
+    from .data import ManifestLoader, load_view_data
+    from .detection import detect_lesion_bbox
+    from .segmentation import segment_lesion
+except ImportError:
+    from alignment import align_mlo_to_cc
+    from classification import BiradsClassifier
+    from correspondence import compute_cross_view_correspondence
+    from data import ManifestLoader, load_view_data
+    from detection import detect_lesion_bbox
+    from segmentation import segment_lesion
 
 
 @dataclass

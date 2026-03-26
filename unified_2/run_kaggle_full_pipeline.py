@@ -6,14 +6,23 @@ import numpy as np
 import pandas as pd
 from PIL import Image, ImageDraw
 from scipy.ndimage import shift
+from skimage.feature import match_template
 from skimage.transform import resize
 
-from unified_mammo_pipeline.alignment import align_mlo_to_cc
-from unified_mammo_pipeline.classification import BiradsClassifier
-from unified_mammo_pipeline.correspondence import compute_cross_view_correspondence
-from unified_mammo_pipeline.data import extract_breast_mask, load_grayscale_image, preprocess_mammogram
-from unified_mammo_pipeline.detection import detect_lesion_bbox
-from unified_mammo_pipeline.segmentation import segment_lesion
+try:
+    from unified_mammo_pipeline.alignment import align_mlo_to_cc
+    from unified_mammo_pipeline.classification import BiradsClassifier
+    from unified_mammo_pipeline.correspondence import compute_cross_view_correspondence
+    from unified_mammo_pipeline.data import extract_breast_mask, load_grayscale_image, preprocess_mammogram
+    from unified_mammo_pipeline.detection import detect_lesion_bbox
+    from unified_mammo_pipeline.segmentation import segment_lesion
+except ImportError:
+    from alignment import align_mlo_to_cc
+    from classification import BiradsClassifier
+    from correspondence import compute_cross_view_correspondence
+    from data import extract_breast_mask, load_grayscale_image, preprocess_mammogram
+    from detection import detect_lesion_bbox
+    from segmentation import segment_lesion
 
 
 def classification_accuracy(y_true: list[int], y_pred: list[int]) -> float | None:
@@ -59,12 +68,27 @@ CSV_FILES = [
 ]
 
 
+def default_classifier_checkpoint() -> str:
+    root = Path(__file__).resolve().parents[1]
+    candidates = [
+        root / "output" / "cnn_attentional_weights.pth",
+        root / "unified-init" / "output" / "cnn_attentional_weights.pth",
+        root / "raw-5" / "output" / "cnn_attentional_weights.pth",
+        root / "raw-4" / "output" / "cnn_attentional_weights.pth",
+        root / "raw-4-og" / "output" / "cnn_attentional_weights.pth",
+    ]
+    for path in candidates:
+        if path.exists():
+            return str(path)
+    return str(candidates[0])
+
+
 def parse_args():
     base_dir = Path("/home/sofa/host_dir/spatial_alignment/dataset/raw/cbisddsm-kaggle")
-    root_dir = Path(__file__).resolve().parents[1]
     parser = argparse.ArgumentParser(description="Full unified pipeline on the CBIS-DDSM Kaggle dataset")
     parser.add_argument("--dataset-base", default=str(base_dir))
-    parser.add_argument("--classifier-checkpoint", default=str(root_dir / "output" / "cnn_attentional_weights.pth"))
+    parser.add_argument("--manifest-csv", default=None)
+    parser.add_argument("--classifier-checkpoint", default=default_classifier_checkpoint())
     parser.add_argument("--output-dir", default=str(Path(__file__).resolve().parent / "kaggle_full_run"))
     parser.add_argument("--limit", type=int, default=2)
     parser.add_argument("--max-long-side", type=int, default=1536)
@@ -93,12 +117,49 @@ def resolve_from_dicom_path(path_str: str, uid_index: dict[str, list[Path]], pre
     return None
 
 
-def build_kaggle_manifest(dataset_base: Path, output_dir: Path) -> pd.DataFrame:
+def resolve_roi_assets(
+    cropped_path_str: str,
+    roi_path_str: str,
+    uid_index: dict[str, list[Path]],
+    asset_cache: dict[str, tuple[Path | None, Path | None]],
+) -> tuple[Path | None, Path | None]:
+    parts = f"{cropped_path_str}/{roi_path_str}".strip().replace("\\", "/").split("/")
+    roi_uid = next((part for part in parts if part in uid_index), None)
+    if roi_uid is None:
+        return None, None
+    if roi_uid in asset_cache:
+        return asset_cache[roi_uid]
+
+    files = uid_index[roi_uid]
+    if not files:
+        asset_cache[roi_uid] = (None, None)
+        return asset_cache[roi_uid]
+    if len(files) == 1:
+        asset_cache[roi_uid] = (None, files[0])
+        return asset_cache[roi_uid]
+
+    scored = []
+    for path in files:
+        image = np.array(Image.open(path).convert("L"), dtype=np.uint8)
+        nonzero_ratio = float((image > 10).mean())
+        scored.append((nonzero_ratio, path))
+    scored.sort(key=lambda item: item[0])
+
+    mask_path = scored[0][1]
+    crop_path = scored[-1][1] if len(scored) > 1 else None
+    asset_cache[roi_uid] = (crop_path, mask_path)
+    return asset_cache[roi_uid]
+
+
+def build_kaggle_manifest(dataset_base: Path, output_dir: Path, pair_limit: int | None = None) -> pd.DataFrame:
     csv_root = dataset_base / "csv"
     jpeg_root = dataset_base / "jpeg"
     uid_index = build_uid_index(jpeg_root)
+    roi_asset_cache: dict[str, tuple[Path | None, Path | None]] = {}
 
-    rows = []
+    grouped = {}
+    completed_patient_sides = set()
+    stop_early = False
     for name in CSV_FILES:
         csv_path = csv_root / name
         if not csv_path.exists():
@@ -107,38 +168,55 @@ def build_kaggle_manifest(dataset_base: Path, output_dir: Path) -> pd.DataFrame:
         df.columns = df.columns.str.strip()
         for _, row in df.iterrows():
             image_path = resolve_from_dicom_path(row.get("image file path", ""), uid_index, prefer_prefix="1-")
-            roi_mask_path = resolve_from_dicom_path(row.get("ROI mask file path", ""), uid_index, prefer_prefix="2-")
+            cropped_image_path, roi_mask_path = resolve_roi_assets(
+                row.get("cropped image file path", ""),
+                row.get("ROI mask file path", ""),
+                uid_index,
+                roi_asset_cache,
+            )
             if image_path is None:
                 continue
-            rows.append(
+            patient_id = str(row.get("patient_id", "")).strip()
+            breast_side = str(row.get("left or right breast", "")).strip().upper()
+            view = str(row.get("image view", "")).strip().upper()
+            key = (patient_id, breast_side, view)
+            grouped.setdefault(
+                key,
                 {
-                    "patient_id": str(row.get("patient_id", "")).strip(),
-                    "breast_side": str(row.get("left or right breast", "")).strip().upper(),
-                    "view": str(row.get("image view", "")).strip().upper(),
-                    "birads": int(row.get("assessment", 0)),
-                    "pathology": str(row.get("pathology", "")).strip(),
-                    "abnormality_type": str(row.get("abnormality type", "")).strip(),
                     "image_path": str(image_path),
-                    "roi_mask_path": str(roi_mask_path) if roi_mask_path else "",
-                    "source_csv": name,
+                    "roi_entries": [],
+                    "birads": [],
+                    "pathology": [],
+                    "abnormality_type": [],
+                },
+            )
+            if roi_mask_path:
+                grouped[key]["roi_entries"].append(
+                {
+                    "mask_path": str(roi_mask_path),
+                    "crop_path": str(cropped_image_path) if cropped_image_path else "",
                 }
             )
+            grouped[key]["birads"].append(int(row.get("assessment", 0)))
+            pathology = str(row.get("pathology", "")).strip()
+            abnormality_type = str(row.get("abnormality type", "")).strip()
+            if pathology:
+                grouped[key]["pathology"].append(pathology)
+            if abnormality_type:
+                grouped[key]["abnormality_type"].append(abnormality_type)
 
-    df = pd.DataFrame(rows)
-    grouped = {}
-    for _, row in df.iterrows():
-        key = (row["patient_id"], row["breast_side"], row["view"])
-        grouped.setdefault(key, {"image_path": row["image_path"], "roi_mask_paths": [], "birads": [], "pathology": [], "abnormality_type": []})
-        if row["roi_mask_path"]:
-            grouped[key]["roi_mask_paths"].append(row["roi_mask_path"])
-        grouped[key]["birads"].append(int(row["birads"]))
-        if row["pathology"]:
-            grouped[key]["pathology"].append(row["pathology"])
-        if row["abnormality_type"]:
-            grouped[key]["abnormality_type"].append(row["abnormality_type"])
+            patient_side = (patient_id, breast_side)
+            if pair_limit:
+                if grouped.get((patient_id, breast_side, "CC")) and grouped.get((patient_id, breast_side, "MLO")):
+                    completed_patient_sides.add(patient_side)
+                if len(completed_patient_sides) >= pair_limit:
+                    stop_early = True
+                    break
+        if stop_early:
+            break
 
     paired_rows = []
-    patient_side_keys = sorted({(patient_id, side) for patient_id, side, _ in grouped.keys()})
+    patient_side_keys = sorted(completed_patient_sides or {(patient_id, side) for patient_id, side, _ in grouped.keys()})
     for patient_id, side in patient_side_keys:
         cc = grouped.get((patient_id, side, "CC"))
         mlo = grouped.get((patient_id, side, "MLO"))
@@ -153,8 +231,8 @@ def build_kaggle_manifest(dataset_base: Path, output_dir: Path) -> pd.DataFrame:
                 "birads_label": int(max(cc["birads"] + mlo["birads"])),
                 "cc_image_path": cc["image_path"],
                 "mlo_image_path": mlo["image_path"],
-                "cc_roi_mask_paths": json.dumps(sorted(set(cc["roi_mask_paths"]))),
-                "mlo_roi_mask_paths": json.dumps(sorted(set(mlo["roi_mask_paths"]))),
+                "cc_roi_entries": json.dumps(cc["roi_entries"]),
+                "mlo_roi_entries": json.dumps(mlo["roi_entries"]),
                 "pathology": ";".join(sorted(set(cc["pathology"] + mlo["pathology"]))),
                 "abnormality_type": ";".join(sorted(set(cc["abnormality_type"] + mlo["abnormality_type"]))),
             }
@@ -179,15 +257,72 @@ def resize_long_side(image: np.ndarray, max_long_side: int) -> np.ndarray:
     return np.array(resized, dtype=np.float32) / 255.0
 
 
-def load_roi_union(mask_paths_json: str, breast_side: str, target_shape: tuple[int, int], max_long_side: int) -> np.ndarray:
-    mask_paths = json.loads(mask_paths_json) if mask_paths_json else []
+def _resize_to_shape(image: np.ndarray, shape: tuple[int, int], nearest: bool = False) -> np.ndarray:
+    if image.shape == shape:
+        return image.astype(np.float32)
+    order = 0 if nearest else 1
+    anti_aliasing = not nearest
+    return resize(image, shape, preserve_range=True, order=order, anti_aliasing=anti_aliasing).astype(np.float32)
+
+
+def place_crop_mask_in_full_image(full_image: np.ndarray, crop_image: np.ndarray, crop_mask: np.ndarray) -> np.ndarray:
+    crop_h, crop_w = crop_image.shape
+    full_h, full_w = full_image.shape
+    placed = np.zeros((full_h, full_w), dtype=np.uint8)
+    if crop_h == 0 or crop_w == 0 or crop_h > full_h or crop_w > full_w:
+        return placed
+
+    response = match_template(full_image.astype(np.float32), crop_image.astype(np.float32), pad_input=False)
+    if response.size == 0:
+        return placed
+    y, x = np.unravel_index(int(np.argmax(response)), response.shape)
+    y2 = min(full_h, y + crop_h)
+    x2 = min(full_w, x + crop_w)
+    placed[y:y2, x:x2] = (crop_mask[: y2 - y, : x2 - x] > 0.5).astype(np.uint8)
+    return placed
+
+
+def load_roi_union(
+    roi_entries_json: str,
+    breast_side: str,
+    full_image: np.ndarray,
+    full_image_original_shape: tuple[int, int],
+) -> np.ndarray:
+    roi_entries = json.loads(roi_entries_json) if roi_entries_json else []
+    target_shape = full_image.shape
     union = np.zeros(target_shape, dtype=np.uint8)
-    for mask_path in mask_paths:
+    scale_y = target_shape[0] / max(full_image_original_shape[0], 1)
+    scale_x = target_shape[1] / max(full_image_original_shape[1], 1)
+
+    for entry in roi_entries:
+        mask_path = entry.get("mask_path", "")
+        crop_path = entry.get("crop_path", "")
+        if not mask_path:
+            continue
+
         mask_img = load_grayscale_image(mask_path, flip_right=breast_side == "RIGHT")
-        mask_img = resize_long_side(mask_img, max_long_side)
-        if mask_img.shape != target_shape:
-            mask_img = resize(mask_img, target_shape, preserve_range=True, order=0, anti_aliasing=False)
-        union = np.maximum(union, (mask_img > 0.5).astype(np.uint8))
+        if mask_img.shape == full_image_original_shape:
+            full_mask = _resize_to_shape(mask_img, target_shape, nearest=True)
+            union = np.maximum(union, (full_mask > 0.5).astype(np.uint8))
+            continue
+
+        if not crop_path:
+            fallback_mask = _resize_to_shape(mask_img, target_shape, nearest=True)
+            union = np.maximum(union, (fallback_mask > 0.5).astype(np.uint8))
+            continue
+
+        crop_img = load_grayscale_image(crop_path, flip_right=breast_side == "RIGHT")
+        if crop_img.shape != mask_img.shape:
+            mask_img = _resize_to_shape(mask_img, crop_img.shape, nearest=True)
+
+        resized_crop_shape = (
+            max(1, int(round(crop_img.shape[0] * scale_y))),
+            max(1, int(round(crop_img.shape[1] * scale_x))),
+        )
+        crop_resized = _resize_to_shape(crop_img, resized_crop_shape, nearest=False)
+        mask_resized = _resize_to_shape(mask_img, resized_crop_shape, nearest=True)
+        placed = place_crop_mask_in_full_image(full_image, crop_resized, mask_resized)
+        union = np.maximum(union, placed)
     return union
 
 
@@ -257,6 +392,21 @@ def overlay_segmentation(image: np.ndarray, mask: np.ndarray, out_path: Path):
     Image.fromarray(rgb).save(out_path)
 
 
+def overlay_gt_comparison(image: np.ndarray, pred_mask: np.ndarray, gt_mask: np.ndarray, out_path: Path):
+    base = np.clip(image * 255.0, 0, 255).astype(np.uint8)
+    rgb = np.stack([base, base, base], axis=-1)
+    # Green marks GT-only pixels, orange marks prediction-only pixels, red marks overlap.
+    pred = pred_mask > 0
+    gt = gt_mask > 0
+    overlap = pred & gt
+    pred_only = pred & ~gt
+    gt_only = gt & ~pred
+    rgb[gt_only] = np.array([0, 255, 0], dtype=np.uint8)
+    rgb[pred_only] = np.array([255, 120, 0], dtype=np.uint8)
+    rgb[overlap] = np.array([255, 0, 0], dtype=np.uint8)
+    Image.fromarray(rgb).save(out_path)
+
+
 def save_alignment_overlay(cc_image: np.ndarray, aligned_mlo: np.ndarray, out_path: Path):
     cc = Image.fromarray(np.clip(cc_image * 255.0, 0, 255).astype(np.uint8)).convert("L")
     mlo = Image.fromarray(np.clip(aligned_mlo * 255.0, 0, 255).astype(np.uint8)).convert("L")
@@ -268,12 +418,16 @@ def main():
     dataset_base = Path(args.dataset_base)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    for name in ["manifests", "detection", "segmentation", "alignment", "correspondence", "classification", "metrics"]:
+    for name in ["manifests", "detection", "segmentation", "gt_comparison", "alignment", "correspondence", "classification", "metrics"]:
         (output_dir / name).mkdir(parents=True, exist_ok=True)
 
-    manifest = build_kaggle_manifest(dataset_base, output_dir / "manifests")
-    if args.limit:
-        manifest = manifest.iloc[: args.limit].copy()
+    if args.manifest_csv:
+        manifest = pd.read_csv(args.manifest_csv)
+        (output_dir / "manifests" / "paired_kaggle_manifest.csv").write_text(manifest.to_csv(index=False))
+    else:
+        manifest = build_kaggle_manifest(dataset_base, output_dir / "manifests", pair_limit=args.limit)
+        if args.limit:
+            manifest = manifest.iloc[: args.limit].copy()
 
     classifier = BiradsClassifier(args.classifier_checkpoint, device=args.device)
     per_sample = []
@@ -284,10 +438,12 @@ def main():
         side = str(row["breast_side"]).strip().upper()
         sample_id = str(row["sample_id"])
 
-        cc_raw = resize_long_side(load_grayscale_image(row["cc_image_path"], flip_right=side == "RIGHT"), args.max_long_side)
-        mlo_raw = resize_long_side(load_grayscale_image(row["mlo_image_path"], flip_right=side == "RIGHT"), args.max_long_side)
-        cc_gt_mask = load_roi_union(row["cc_roi_mask_paths"], side, cc_raw.shape, args.max_long_side)
-        mlo_gt_mask = load_roi_union(row["mlo_roi_mask_paths"], side, mlo_raw.shape, args.max_long_side)
+        cc_raw_original = load_grayscale_image(row["cc_image_path"], flip_right=side == "RIGHT")
+        mlo_raw_original = load_grayscale_image(row["mlo_image_path"], flip_right=side == "RIGHT")
+        cc_raw = resize_long_side(cc_raw_original, args.max_long_side)
+        mlo_raw = resize_long_side(mlo_raw_original, args.max_long_side)
+        cc_gt_mask = load_roi_union(row["cc_roi_entries"], side, cc_raw, cc_raw_original.shape)
+        mlo_gt_mask = load_roi_union(row["mlo_roi_entries"], side, mlo_raw, mlo_raw_original.shape)
 
         cc_img = preprocess_mammogram(cc_raw)
         mlo_img = preprocess_mammogram(mlo_raw)
@@ -345,6 +501,8 @@ def main():
         overlay_detection(mlo_img, mlo_det.bbox_xywh, output_dir / "detection" / f"{sample_id}_MLO_detection.png")
         overlay_segmentation(cc_img, cc_seg.mask, output_dir / "segmentation" / f"{sample_id}_CC_segmentation.png")
         overlay_segmentation(mlo_img, mlo_seg.mask, output_dir / "segmentation" / f"{sample_id}_MLO_segmentation.png")
+        overlay_gt_comparison(cc_img, cc_seg.mask, cc_gt_mask, output_dir / "gt_comparison" / f"{sample_id}_CC_gt_comparison.png")
+        overlay_gt_comparison(mlo_img, mlo_seg.mask, mlo_gt_mask, output_dir / "gt_comparison" / f"{sample_id}_MLO_gt_comparison.png")
         save_alignment_overlay(cc_img, alignment.aligned_image, output_dir / "alignment" / f"{sample_id}_alignment_overlay.png")
         (output_dir / "correspondence" / f"{sample_id}_correspondence.json").write_text(json.dumps(correspondence.to_dict(), indent=2))
         (output_dir / "classification" / f"{sample_id}_classification.json").write_text(

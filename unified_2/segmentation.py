@@ -4,6 +4,8 @@ import numpy as np
 from scipy.ndimage import gaussian_filter
 from skimage import measure, morphology
 
+from localizer import predict_localization
+
 
 @dataclass
 class SegmentationResult:
@@ -31,7 +33,7 @@ def _largest_component(binary: np.ndarray, image: np.ndarray) -> tuple[np.ndarra
     return best_mask, best_area, max(best_score, 0.0)
 
 
-def segment_lesion(image: np.ndarray, breast_mask: np.ndarray) -> SegmentationResult:
+def _heuristic_segment(image: np.ndarray, breast_mask: np.ndarray) -> SegmentationResult:
     masked = image * breast_mask
     smooth = gaussian_filter(masked, sigma=1.2)
     background = gaussian_filter(masked, sigma=9.0)
@@ -61,3 +63,14 @@ def segment_lesion(image: np.ndarray, breast_mask: np.ndarray) -> SegmentationRe
     cy = int(np.mean(ys)) if len(ys) else image.shape[0] // 2
     cx = int(np.mean(xs)) if len(xs) else image.shape[1] // 2
     return SegmentationResult(mask.astype(np.uint8), (cy, cx), area, float(score))
+
+
+def segment_lesion(image: np.ndarray, breast_mask: np.ndarray) -> SegmentationResult:
+    localization = predict_localization(image, breast_mask)
+    if localization is not None and localization.binary_mask.sum() > 0:
+        mask = localization.binary_mask.astype(np.uint8)
+        ys, xs = np.where(mask > 0)
+        cy = int(np.mean(ys)) if len(ys) else image.shape[0] // 2
+        cx = int(np.mean(xs)) if len(xs) else image.shape[1] // 2
+        return SegmentationResult(mask=mask, center_yx=(cy, cx), area=int(mask.sum()), score=float(localization.confidence))
+    return _heuristic_segment(image, breast_mask)

@@ -1,0 +1,13 @@
+{
+  "sample_id": "P_01181_LEFT",
+  "true_birads": 4,
+  "predicted_birads": 4,
+  "ordinal_scores": [
+    0.7948564887046814,
+    0.7876594662666321,
+    0.5397422909736633,
+    0.5069122314453125,
+    0.4616070091724396
+  ],
+  "source": "cnn_cross_attention"
+}
