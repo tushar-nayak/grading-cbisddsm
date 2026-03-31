@@ -11,14 +11,14 @@ from skimage.transform import resize
 
 try:
     from unified_mammo_pipeline.alignment import align_mlo_to_cc
-    from unified_mammo_pipeline.classification import BiradsClassifier
+    from unified_mammo_pipeline.classification import BiradsClassifier, birads_to_binary_label
     from unified_mammo_pipeline.correspondence import compute_cross_view_correspondence
     from unified_mammo_pipeline.data import extract_breast_mask, load_grayscale_image, preprocess_mammogram
     from unified_mammo_pipeline.detection import detect_lesion_bbox
     from unified_mammo_pipeline.segmentation import segment_lesion
 except ImportError:
     from alignment import align_mlo_to_cc
-    from classification import BiradsClassifier
+    from classification import BiradsClassifier, birads_to_binary_label
     from correspondence import compute_cross_view_correspondence
     from data import extract_breast_mask, load_grayscale_image, preprocess_mammogram
     from detection import detect_lesion_bbox
@@ -229,6 +229,7 @@ def build_kaggle_manifest(dataset_base: Path, output_dir: Path, pair_limit: int 
                 "sample_id": sample_id,
                 "breast_side": side,
                 "birads_label": int(max(cc["birads"] + mlo["birads"])),
+                "binary_label": birads_to_binary_label(int(max(cc["birads"] + mlo["birads"]))),
                 "cc_image_path": cc["image_path"],
                 "mlo_image_path": mlo["image_path"],
                 "cc_roi_entries": json.dumps(cc["roi_entries"]),
@@ -423,6 +424,9 @@ def main():
 
     if args.manifest_csv:
         manifest = pd.read_csv(args.manifest_csv)
+        if "binary_label" not in manifest.columns:
+            manifest = manifest.copy()
+            manifest["binary_label"] = manifest["birads_label"].map(birads_to_binary_label)
         (output_dir / "manifests" / "paired_kaggle_manifest.csv").write_text(manifest.to_csv(index=False))
     else:
         manifest = build_kaggle_manifest(dataset_base, output_dir / "manifests", pair_limit=args.limit)
@@ -463,8 +467,8 @@ def main():
 
         cls = classifier.predict(cc_img, alignment.aligned_image, cc_seg.mask, aligned_mlo_mask.astype(np.uint8), cc_det.bbox_xywh, mlo_det.bbox_xywh)
 
-        y_true.append(int(row["birads_label"]))
-        y_pred.append(int(cls.predicted_birads))
+        y_true.append(int(row["binary_label"]))
+        y_pred.append(int(cls.predicted_binary_label))
 
         cc_det_mask = bbox_to_mask(cc_det.bbox_xywh, cc_seg.mask.shape)
         mlo_det_mask = bbox_to_mask(mlo_det.bbox_xywh, mlo_seg.mask.shape)
@@ -475,7 +479,9 @@ def main():
             "sample_id": sample_id,
             "patient_id": row["patient_id"],
             "true_birads": int(row["birads_label"]),
+            "true_binary_label": int(row["binary_label"]),
             "predicted_birads": int(cls.predicted_birads),
+            "predicted_binary_label": int(cls.predicted_binary_label),
             "classifier_source": cls.source,
             "cc_seg_dice_vs_roi": dice_score(cc_seg.mask, cc_gt_mask),
             "cc_seg_iou_vs_roi": iou_score(cc_seg.mask, cc_gt_mask),
@@ -510,7 +516,9 @@ def main():
                 {
                     "sample_id": sample_id,
                     "true_birads": int(row["birads_label"]),
+                    "true_binary_label": int(row["binary_label"]),
                     "predicted_birads": int(cls.predicted_birads),
+                    "predicted_binary_label": int(cls.predicted_binary_label),
                     "ordinal_scores": cls.ordinal_scores,
                     "source": cls.source,
                 },
@@ -524,6 +532,7 @@ def main():
     aggregate = {
         "dataset_base": str(dataset_base),
         "num_samples": int(len(per_sample_df)),
+        "classification_target": "binary_birads_0_3_vs_4_5",
         "classification_accuracy": classification_accuracy(y_true, y_pred),
         "classification_f1_weighted": weighted_f1(y_true, y_pred),
         "classification_confusion_matrix": confusion_matrix_list(y_true, y_pred),

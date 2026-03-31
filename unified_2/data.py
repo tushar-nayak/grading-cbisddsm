@@ -7,6 +7,11 @@ import pandas as pd
 from PIL import Image
 from skimage import exposure, filters, measure, morphology
 
+try:
+    from unified_mammo_pipeline.classification import birads_to_binary_label
+except ImportError:
+    from classification import birads_to_binary_label
+
 
 @dataclass
 class ManifestSample:
@@ -14,6 +19,7 @@ class ManifestSample:
     sample_id: str
     breast_side: str
     birads_label: int
+    binary_label: int
     cc_image_path: str
     mlo_image_path: str
 
@@ -44,6 +50,7 @@ class ManifestLoader:
                     sample_id=sample_id,
                     breast_side=str(row["breast_side"]),
                     birads_label=int(row["birads_label"]),
+                    binary_label=int(row["binary_label"]) if "binary_label" in row else birads_to_binary_label(int(row["birads_label"])),
                     cc_image_path=str(row["cc_image_path"]),
                     mlo_image_path=str(row["mlo_image_path"]),
                 )

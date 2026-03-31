@@ -8,9 +8,14 @@ from PIL import Image
 from torchvision import models
 
 
+def birads_to_binary_label(birads: int) -> int:
+    return 1 if int(birads) >= 4 else 0
+
+
 @dataclass
 class ClassificationResult:
     predicted_birads: int
+    predicted_binary_label: int
     ordinal_scores: list[float]
     source: str
 
@@ -95,7 +100,12 @@ class BiradsClassifier:
                 pred = 2
             else:
                 pred = 1
-            return ClassificationResult(predicted_birads=pred, ordinal_scores=[], source="heuristic")
+            return ClassificationResult(
+                predicted_birads=pred,
+                predicted_binary_label=birads_to_binary_label(pred),
+                ordinal_scores=[],
+                source="heuristic",
+            )
 
         cc_channel = self._prepare_channel(cc_image, cc_mask, cc_bbox)
         mlo_channel = self._prepare_channel(aligned_mlo, mlo_mask, mlo_bbox)
@@ -105,4 +115,9 @@ class BiradsClassifier:
             logits = self.model(tensor)
             scores = torch.sigmoid(logits).squeeze(0).cpu().tolist()
         pred = max(1, int((torch.tensor(scores) > 0.5).sum().item()))
-        return ClassificationResult(predicted_birads=pred, ordinal_scores=[float(x) for x in scores], source="cnn_cross_attention")
+        return ClassificationResult(
+            predicted_birads=pred,
+            predicted_binary_label=birads_to_binary_label(pred),
+            ordinal_scores=[float(x) for x in scores],
+            source="cnn_cross_attention",
+        )

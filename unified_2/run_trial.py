@@ -45,8 +45,9 @@ def main():
     if payload:
         first = payload[0]
         print(
-            f"First sample: {first['sample_id']} | true={first['true_birads']} | "
-            f"pred={first['predicted_birads']} | source={first['classifier_source']}"
+            f"First sample: {first['sample_id']} | true_birads={first['true_birads']} | "
+            f"true_binary={first['true_binary_label']} | pred_birads={first['predicted_birads']} | "
+            f"pred_binary={first['predicted_binary_label']} | source={first['classifier_source']}"
         )
 
 

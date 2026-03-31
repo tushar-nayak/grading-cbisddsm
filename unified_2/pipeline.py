@@ -38,7 +38,9 @@ class SampleStageResult:
     sample_id: str
     breast_side: str
     true_birads: int
+    true_binary_label: int
     predicted_birads: int
+    predicted_binary_label: int
     classifier_source: str
     cc: ViewStageResult
     mlo: ViewStageResult
@@ -123,7 +125,9 @@ class UnifiedMammoPipeline:
                 sample_id=sample.sample_id,
                 breast_side=sample.breast_side,
                 true_birads=sample.birads_label,
+                true_binary_label=sample.binary_label,
                 predicted_birads=classification.predicted_birads,
+                predicted_binary_label=classification.predicted_binary_label,
                 classifier_source=classification.source,
                 cc=ViewStageResult(
                     image_path=sample.cc_image_path,
