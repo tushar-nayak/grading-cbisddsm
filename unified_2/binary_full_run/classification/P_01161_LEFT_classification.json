@@ -1,0 +1,17 @@
+{
+  "sample_id": "P_01161_LEFT",
+  "true_birads": 4,
+  "true_binary_label": 1,
+  "true_binary_name": "birads_4_5",
+  "predicted_birads": 4,
+  "predicted_binary_label": 1,
+  "predicted_binary_name": "birads_4_5",
+  "ordinal_scores": [
+    0.8504950404167175,
+    0.8753378987312317,
+    0.7437791228294373,
+    0.5056095123291016,
+    0.3026440441608429
+  ],
+  "source": "cnn_cross_attention"
+}
