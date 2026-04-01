@@ -1,0 +1,1972 @@
+__init__.py
+from .pipeline import UnifiedMammoPipeline
+
+__all__ = ["UnifiedMammoPipeline"]
+
+
+
+alignment.py
+from dataclasses import dataclass
+
+import numpy as np
+from scipy.ndimage import shift
+from skimage.transform import resize
+
+
+@dataclass
+class AlignmentResult:
+    aligned_image: np.ndarray
+    affine_matrix: list[list[float]]
+
+    def to_dict(self):
+        return {"affine_matrix": self.affine_matrix}
+
+
+def _center_from_mask(mask: np.ndarray) -> tuple[float, float]:
+    ys, xs = np.where(mask > 0)
+    if len(ys) == 0:
+        return mask.shape[1] / 2.0, mask.shape[0] / 2.0
+    return float(np.mean(xs)), float(np.mean(ys))
+
+
+def align_mlo_to_cc(cc_image: np.ndarray, mlo_image: np.ndarray, cc_mask: np.ndarray, mlo_mask: np.ndarray) -> AlignmentResult:
+    target_h, target_w = cc_image.shape
+    mlo_resized = resize(mlo_image, (target_h, target_w), preserve_range=True, anti_aliasing=True).astype(np.float32)
+    mlo_mask_resized = resize(mlo_mask.astype(np.float32), (target_h, target_w), preserve_range=True, order=0, anti_aliasing=False) > 0.5
+
+    cc_cx, cc_cy = _center_from_mask(cc_mask)
+    mlo_cx, mlo_cy = _center_from_mask(mlo_mask_resized)
+    dx = cc_cx - mlo_cx
+    dy = cc_cy - mlo_cy
+
+    aligned = shift(mlo_resized, shift=(dy, dx), order=1, mode="constant", cval=0.0).astype(np.float32)
+    matrix = [[1.0, 0.0, float(dx)], [0.0, 1.0, float(dy)]]
+    return AlignmentResult(aligned_image=aligned, affine_matrix=matrix)
+
+
+
+classification.py
+from dataclasses import dataclass
+from pathlib import Path
+
+import numpy as np
+import torch
+import torch.nn as nn
+from PIL import Image
+from torchvision import models
+
+
+def birads_to_binary_label(birads: int) -> int:
+    return 1 if int(birads) >= 4 else 0
+
+
+@dataclass
+class ClassificationResult:
+    predicted_birads: int
+    predicted_binary_label: int
+    ordinal_scores: list[float]
+    source: str
+
+
+class CNNCrossAttentionGrader(nn.Module):
+    def __init__(self, num_classes: int = 6):
+        super().__init__()
+        resnet = models.resnet50(weights=None)
+        resnet.conv1 = nn.Conv2d(1, 64, kernel_size=7, stride=2, padding=3, bias=False)
+        self.feature_extractor = nn.Sequential(*list(resnet.children())[:-2])
+        embed_dim = 2048
+        self.cross_attention = nn.MultiheadAttention(embed_dim=embed_dim, num_heads=8, batch_first=True)
+        self.global_pool = nn.AdaptiveAvgPool2d((1, 1))
+        self.classifier = nn.Sequential(
+            nn.Linear(embed_dim * 2, 512),
+            nn.BatchNorm1d(512),
+            nn.ReLU(),
+            nn.Dropout(0.5),
+            nn.Linear(512, num_classes - 1),
+        )
+
+    def forward(self, dual_tensor: torch.Tensor) -> torch.Tensor:
+        cc_img = dual_tensor[:, 0:1, :, :]
+        mlo_img = dual_tensor[:, 1:2, :, :]
+        cc_feat = self.feature_extractor(cc_img)
+        mlo_feat = self.feature_extractor(mlo_img)
+        batch_size, channels, height, width = cc_feat.shape
+        cc_seq = cc_feat.view(batch_size, channels, -1).permute(0, 2, 1)
+        mlo_seq = mlo_feat.view(batch_size, channels, -1).permute(0, 2, 1)
+        attended_mlo_seq, _ = self.cross_attention(query=cc_seq, key=mlo_seq, value=mlo_seq)
+        attended_mlo_feat = attended_mlo_seq.permute(0, 2, 1).view(batch_size, channels, height, width)
+        cc_pooled = self.global_pool(cc_feat).view(batch_size, -1)
+        mlo_pooled = self.global_pool(attended_mlo_feat).view(batch_size, -1)
+        fused = torch.cat([cc_pooled, mlo_pooled], dim=1)
+        return self.classifier(fused)
+
+
+class BiradsClassifier:
+    def __init__(self, checkpoint_path: str | None = None, device: str | None = None):
+        self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
+        self.checkpoint_path = Path(checkpoint_path) if checkpoint_path else None
+        self.model = None
+        if self.checkpoint_path and self.checkpoint_path.exists():
+            self.model = CNNCrossAttentionGrader().to(self.device)
+            state = torch.load(self.checkpoint_path, map_location=self.device)
+            self.model.load_state_dict(state)
+            self.model.eval()
+
+    def _resize(self, image: np.ndarray, size: int, nearest: bool = False) -> np.ndarray:
+        pil = Image.fromarray(np.clip(image * 255.0, 0, 255).astype(np.uint8))
+        resample = Image.Resampling.NEAREST if nearest else Image.Resampling.BILINEAR
+        return np.array(pil.resize((size, size), resample=resample), dtype=np.float32) / 255.0
+
+    def _prepare_channel(self, image: np.ndarray, mask: np.ndarray, bbox: list[int] | None) -> np.ndarray:
+        resized = self._resize(image, 224, nearest=False)
+        if resized.max() > resized.min():
+            resized = (resized - resized.min()) / (resized.max() - resized.min())
+        guide = self._resize(mask.astype(np.float32), 224, nearest=True)
+        if bbox is not None:
+            x, y, w, h = bbox
+            sx = 224.0 / image.shape[1]
+            sy = 224.0 / image.shape[0]
+            x1 = max(0, int(round(x * sx)))
+            y1 = max(0, int(round(y * sy)))
+            x2 = min(224, int(round((x + w) * sx)))
+            y2 = min(224, int(round((y + h) * sy)))
+            guide[y1:y2, x1:x2] = 1.0
+        enhanced = np.clip(resized * (1.0 + 0.35 * guide), 0.0, 1.0)
+        enhanced = (enhanced - 0.5) / 0.5
+        return enhanced.astype(np.float32)
+
+    def predict(self, cc_image: np.ndarray, aligned_mlo: np.ndarray, cc_mask: np.ndarray, mlo_mask: np.ndarray, cc_bbox: list[int] | None, mlo_bbox: list[int] | None) -> ClassificationResult:
+        if self.model is None:
+            lesion_ratio = float((cc_mask.sum() + mlo_mask.sum()) / max(cc_mask.size + mlo_mask.size, 1))
+            if lesion_ratio > 0.12:
+                pred = 5
+            elif lesion_ratio > 0.06:
+                pred = 4
+            elif lesion_ratio > 0.025:
+                pred = 3
+            elif lesion_ratio > 0.01:
+                pred = 2
+            else:
+                pred = 1
+            return ClassificationResult(
+                predicted_birads=pred,
+                predicted_binary_label=birads_to_binary_label(pred),
+                ordinal_scores=[],
+                source="heuristic",
+            )
+
+        cc_channel = self._prepare_channel(cc_image, cc_mask, cc_bbox)
+        mlo_channel = self._prepare_channel(aligned_mlo, mlo_mask, mlo_bbox)
+        stacked = np.stack([cc_channel, mlo_channel], axis=0)
+        tensor = torch.from_numpy(stacked).unsqueeze(0).to(self.device)
+        with torch.no_grad():
+            logits = self.model(tensor)
+            scores = torch.sigmoid(logits).squeeze(0).cpu().tolist()
+        pred = max(1, int((torch.tensor(scores) > 0.5).sum().item()))
+        return ClassificationResult(
+            predicted_birads=pred,
+            predicted_binary_label=birads_to_binary_label(pred),
+            ordinal_scores=[float(x) for x in scores],
+            source="cnn_cross_attention",
+        )
+
+
+
+correspondence.py
+from dataclasses import dataclass, asdict
+
+import numpy as np
+from scipy.ndimage import laplace
+
+
+@dataclass
+class CorrespondenceResult:
+    cc_center_norm: tuple[float, float]
+    mlo_center_norm: tuple[float, float]
+    fused_center_norm: tuple[float, float]
+    centroid_distance_px: float
+    cc_weight: float
+    mlo_weight: float
+
+    def to_dict(self):
+        return asdict(self)
+
+
+def assess_image_quality(image: np.ndarray) -> float:
+    lap_var = float(laplace(image).var())
+    contrast = float(image.std())
+    quality = min(1.0, (lap_var / 0.005) * 0.6 + (contrast / 0.3) * 0.4)
+    return float(np.clip(quality, 0.05, 1.0))
+
+
+def compute_cross_view_correspondence(cc_mask: np.ndarray, mlo_mask: np.ndarray, cc_image: np.ndarray, mlo_image: np.ndarray) -> CorrespondenceResult:
+    cc_ys, cc_xs = np.where(cc_mask > 0)
+    mlo_ys, mlo_xs = np.where(mlo_mask > 0)
+
+    h = max(cc_mask.shape[0], mlo_mask.shape[0])
+    w = max(cc_mask.shape[1], mlo_mask.shape[1])
+
+    cc_cy = float(np.mean(cc_ys)) if len(cc_ys) else cc_mask.shape[0] / 2.0
+    cc_cx = float(np.mean(cc_xs)) if len(cc_xs) else cc_mask.shape[1] / 2.0
+    mlo_cy = float(np.mean(mlo_ys)) if len(mlo_ys) else mlo_mask.shape[0] / 2.0
+    mlo_cx = float(np.mean(mlo_xs)) if len(mlo_xs) else mlo_mask.shape[1] / 2.0
+
+    cc_center_norm = (cc_cx / cc_mask.shape[1], cc_cy / cc_mask.shape[0])
+    mlo_center_norm = (mlo_cx / mlo_mask.shape[1], mlo_cy / mlo_mask.shape[0])
+
+    cc_q = assess_image_quality(cc_image)
+    mlo_q = assess_image_quality(mlo_image)
+    total_q = cc_q + mlo_q
+    cc_weight = cc_q / total_q
+    mlo_weight = mlo_q / total_q
+
+    fused_center_norm = (
+        cc_weight * cc_center_norm[0] + mlo_weight * mlo_center_norm[0],
+        cc_weight * cc_center_norm[1] + mlo_weight * mlo_center_norm[1],
+    )
+    dist = float(np.sqrt((cc_center_norm[0] - mlo_center_norm[0]) ** 2 + (cc_center_norm[1] - mlo_center_norm[1]) ** 2) * max(h, w))
+    return CorrespondenceResult(cc_center_norm, mlo_center_norm, fused_center_norm, dist, float(cc_weight), float(mlo_weight))
+
+
+
+data.py
+from dataclasses import dataclass
+from pathlib import Path
+from typing import List
+
+import numpy as np
+import pandas as pd
+from PIL import Image
+from skimage import exposure, filters, measure, morphology
+
+try:
+    from unified_mammo_pipeline.classification import birads_to_binary_label
+except ImportError:
+    from classification import birads_to_binary_label
+
+
+@dataclass
+class ManifestSample:
+    patient_id: str
+    sample_id: str
+    breast_side: str
+    birads_label: int
+    binary_label: int
+    cc_image_path: str
+    mlo_image_path: str
+
+
+@dataclass
+class ViewData:
+    image_path: str
+    raw_image: np.ndarray
+    preprocessed_image: np.ndarray
+    breast_mask: np.ndarray
+
+
+class ManifestLoader:
+    def __init__(self, manifest_csv: str):
+        self.manifest_csv = Path(manifest_csv)
+        self.frame = pd.read_csv(self.manifest_csv)
+
+    def load_samples(self, limit: int | None = None) -> List[ManifestSample]:
+        rows = self.frame.iloc[:limit] if limit else self.frame
+        samples = []
+        for idx, row in rows.iterrows():
+            cc_stem = Path(str(row["cc_image_path"])).stem
+            patient_id = str(row.get("patient_id", "")).strip() or f"case_{idx:05d}"
+            sample_id = str(row.get("sample_id", "")).strip() or f"{patient_id}_{str(row['breast_side']).strip().upper()}_{cc_stem}"
+            samples.append(
+                ManifestSample(
+                    patient_id=patient_id,
+                    sample_id=sample_id,
+                    breast_side=str(row["breast_side"]),
+                    birads_label=int(row["birads_label"]),
+                    binary_label=int(row["binary_label"]) if "binary_label" in row else birads_to_binary_label(int(row["birads_label"])),
+                    cc_image_path=str(row["cc_image_path"]),
+                    mlo_image_path=str(row["mlo_image_path"]),
+                )
+            )
+        return samples
+
+
+def load_grayscale_image(image_path: str, flip_right: bool = False) -> np.ndarray:
+    image = Image.open(image_path).convert("L")
+    if flip_right:
+        image = image.transpose(Image.FLIP_LEFT_RIGHT)
+    arr = np.array(image, dtype=np.float32)
+    if arr.max() > 0:
+        arr /= 255.0
+    return arr
+
+
+def preprocess_mammogram(image: np.ndarray) -> np.ndarray:
+    enhanced = exposure.equalize_adapthist(image, clip_limit=0.03)
+    blurred = filters.gaussian(enhanced, sigma=1.0, preserve_range=True)
+    blurred = blurred.astype(np.float32)
+    if blurred.max() > blurred.min():
+        blurred = (blurred - blurred.min()) / (blurred.max() - blurred.min())
+    return blurred.astype(np.float32)
+
+
+def extract_breast_mask(image: np.ndarray, threshold: float = 0.05) -> np.ndarray:
+    binary = image > threshold
+    binary = morphology.binary_opening(binary, morphology.disk(5))
+    binary = morphology.binary_closing(binary, morphology.disk(9))
+    labels = measure.label(binary)
+    if labels.max() == 0:
+        return binary.astype(np.uint8)
+    regions = measure.regionprops(labels)
+    largest = max(regions, key=lambda r: r.area)
+    return (labels == largest.label).astype(np.uint8)
+
+
+def load_view_data(image_path: str, breast_side: str) -> ViewData:
+    flip_right = breast_side.strip().upper() == "RIGHT"
+    raw = load_grayscale_image(image_path, flip_right=flip_right)
+    preprocessed = preprocess_mammogram(raw)
+    breast_mask = extract_breast_mask(preprocessed)
+    return ViewData(
+        image_path=image_path,
+        raw_image=raw,
+        preprocessed_image=preprocessed,
+        breast_mask=breast_mask,
+    )
+
+
+
+detection.py
+from dataclasses import dataclass
+
+import numpy as np
+from scipy.ndimage import gaussian_filter
+from skimage import measure, morphology
+
+from localizer import predict_localization
+
+
+@dataclass
+class DetectionResult:
+    bbox_xywh: list[int] | None
+    confidence: float
+    heatmap: np.ndarray
+
+
+def _heuristic_detect(image: np.ndarray, breast_mask: np.ndarray) -> DetectionResult:
+    masked = image * breast_mask
+    local = gaussian_filter(masked, sigma=1.0)
+    broad = gaussian_filter(masked, sigma=12.0)
+    heatmap = np.clip(local - broad, 0.0, 1.0)
+    active = heatmap[breast_mask > 0]
+    if active.size == 0:
+        return DetectionResult(None, 0.0, heatmap)
+
+    threshold = float(active.mean() + 1.0 * active.std())
+    binary = (heatmap > threshold) & (breast_mask > 0)
+    binary = morphology.binary_dilation(binary, morphology.disk(6))
+    binary = morphology.remove_small_objects(binary, min_size=20)
+    labels = measure.label(binary)
+    if labels.max() == 0:
+        return DetectionResult(None, 0.0, heatmap)
+
+    region = max(measure.regionprops(labels, intensity_image=heatmap), key=lambda r: r.area)
+    min_row, min_col, max_row, max_col = region.bbox
+    x, y = int(min_col), int(min_row)
+    w, h = int(max_col - min_col), int(max_row - min_row)
+    confidence = float(min(1.0, region.mean_intensity * 2.5 + np.sqrt(max(region.area, 1.0)) / 1000.0))
+    return DetectionResult([x, y, w, h], confidence, heatmap)
+
+
+def detect_lesion_bbox(image: np.ndarray, breast_mask: np.ndarray) -> DetectionResult:
+    localization = predict_localization(image, breast_mask)
+    if localization is not None:
+        ys, xs = np.where(localization.binary_mask > 0)
+        if len(ys) > 0:
+            x1, x2 = int(xs.min()), int(xs.max())
+            y1, y2 = int(ys.min()), int(ys.max())
+            bbox = [x1, y1, x2 - x1 + 1, y2 - y1 + 1]
+            return DetectionResult(bbox_xywh=bbox, confidence=float(localization.confidence), heatmap=localization.probability_map)
+        return DetectionResult(None, float(localization.confidence), localization.probability_map)
+    return _heuristic_detect(image, breast_mask)
+
+
+
+localizer.py
+from dataclasses import dataclass
+from pathlib import Path
+
+import numpy as np
+from PIL import Image
+from scipy.ndimage import gaussian_filter
+from skimage import measure, morphology
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+@dataclass
+class LocalizationPrediction:
+    probability_map: np.ndarray
+    binary_mask: np.ndarray
+    confidence: float
+
+
+class ConvBlock(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int):
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.block(x)
+
+
+class SmallUNet(nn.Module):
+    def __init__(self, in_channels: int = 1, base_channels: int = 16):
+        super().__init__()
+        self.enc1 = ConvBlock(in_channels, base_channels)
+        self.enc2 = ConvBlock(base_channels, base_channels * 2)
+        self.enc3 = ConvBlock(base_channels * 2, base_channels * 4)
+        self.enc4 = ConvBlock(base_channels * 4, base_channels * 8)
+        self.pool = nn.MaxPool2d(2)
+
+        self.bottleneck = ConvBlock(base_channels * 8, base_channels * 16)
+
+        self.up4 = nn.ConvTranspose2d(base_channels * 16, base_channels * 8, kernel_size=2, stride=2)
+        self.dec4 = ConvBlock(base_channels * 16, base_channels * 8)
+        self.up3 = nn.ConvTranspose2d(base_channels * 8, base_channels * 4, kernel_size=2, stride=2)
+        self.dec3 = ConvBlock(base_channels * 8, base_channels * 4)
+        self.up2 = nn.ConvTranspose2d(base_channels * 4, base_channels * 2, kernel_size=2, stride=2)
+        self.dec2 = ConvBlock(base_channels * 4, base_channels * 2)
+        self.up1 = nn.ConvTranspose2d(base_channels * 2, base_channels, kernel_size=2, stride=2)
+        self.dec1 = ConvBlock(base_channels * 2, base_channels)
+        self.head = nn.Conv2d(base_channels, 1, kernel_size=1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        e1 = self.enc1(x)
+        e2 = self.enc2(self.pool(e1))
+        e3 = self.enc3(self.pool(e2))
+        e4 = self.enc4(self.pool(e3))
+        b = self.bottleneck(self.pool(e4))
+
+        d4 = self.up4(b)
+        d4 = self.dec4(torch.cat([d4, e4], dim=1))
+        d3 = self.up3(d4)
+        d3 = self.dec3(torch.cat([d3, e3], dim=1))
+        d2 = self.up2(d3)
+        d2 = self.dec2(torch.cat([d2, e2], dim=1))
+        d1 = self.up1(d2)
+        d1 = self.dec1(torch.cat([d1, e1], dim=1))
+        return self.head(d1)
+
+
+_DEFAULT_CHECKPOINT = Path(__file__).resolve().parents[1] / "output" / "localizer_unet.pth"
+_DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+_MODEL_CACHE: dict[tuple[str, str], SmallUNet | None] = {}
+
+
+def default_localizer_checkpoint() -> str:
+    return str(_DEFAULT_CHECKPOINT)
+
+
+def _largest_component(binary: np.ndarray, score_map: np.ndarray) -> tuple[np.ndarray, int, float]:
+    labels = measure.label(binary)
+    if labels.max() == 0:
+        return np.zeros_like(binary, dtype=np.uint8), 0, 0.0
+    best_mask = np.zeros_like(binary, dtype=np.uint8)
+    best_area = 0
+    best_score = -1.0
+    for region in measure.regionprops(labels, intensity_image=score_map):
+        if region.area < 8:
+            continue
+        score = float(region.mean_intensity * np.sqrt(region.area))
+        if score > best_score:
+            best_score = score
+            best_area = int(region.area)
+            best_mask = (labels == region.label).astype(np.uint8)
+    return best_mask, best_area, max(best_score, 0.0)
+
+
+def load_localizer(checkpoint_path: str | None = None, device: str | None = None) -> SmallUNet | None:
+    path = str(Path(checkpoint_path) if checkpoint_path else _DEFAULT_CHECKPOINT)
+    target_device = str(torch.device(device or _DEVICE))
+    cache_key = (path, target_device)
+    if cache_key in _MODEL_CACHE:
+        return _MODEL_CACHE[cache_key]
+
+    ckpt = Path(path)
+    if not ckpt.exists():
+        _MODEL_CACHE[cache_key] = None
+        return None
+
+    model = SmallUNet()
+    state = torch.load(ckpt, map_location=target_device)
+    if isinstance(state, dict) and "model_state" in state:
+        state = state["model_state"]
+    model.load_state_dict(state)
+    model.to(target_device)
+    model.eval()
+    _MODEL_CACHE[cache_key] = model
+    return model
+
+
+def predict_localization(
+    image: np.ndarray,
+    breast_mask: np.ndarray,
+    checkpoint_path: str | None = None,
+    device: str | None = None,
+    input_size: int = 256,
+    threshold: float = 0.35,
+) -> LocalizationPrediction | None:
+    model = load_localizer(checkpoint_path=checkpoint_path, device=device)
+    if model is None:
+        return None
+
+    image_f = image.astype(np.float32)
+    breast_mask_f = breast_mask.astype(np.float32)
+    masked = image_f * breast_mask_f
+    pil = Image.fromarray(np.clip(masked * 255.0, 0, 255).astype(np.uint8))
+    resized = np.array(pil.resize((input_size, input_size), Image.Resampling.BILINEAR), dtype=np.float32) / 255.0
+    if resized.max() > resized.min():
+        resized = (resized - resized.min()) / (resized.max() - resized.min())
+
+    tensor = torch.from_numpy(resized).unsqueeze(0).unsqueeze(0).to(next(model.parameters()).device)
+    with torch.no_grad():
+        logits = model(tensor)
+        probs = torch.sigmoid(logits)
+        probs = F.interpolate(probs, size=image_f.shape, mode="bilinear", align_corners=False)
+    prob_map = probs.squeeze().cpu().numpy().astype(np.float32)
+    prob_map *= breast_mask_f
+
+    active = prob_map[breast_mask_f > 0]
+    if active.size == 0:
+        return LocalizationPrediction(np.zeros_like(image_f, dtype=np.float32), np.zeros_like(image_f, dtype=np.uint8), 0.0)
+
+    binary = prob_map >= threshold
+    binary = morphology.binary_opening(binary, morphology.disk(2))
+    binary = morphology.binary_closing(binary, morphology.disk(3))
+    binary = morphology.remove_small_objects(binary, min_size=12)
+    mask, area, score = _largest_component(binary, prob_map)
+
+    if area == 0:
+        fallback = (prob_map >= np.quantile(active, 0.995)) & (breast_mask_f > 0)
+        fallback = morphology.binary_dilation(fallback, morphology.disk(2))
+        mask, area, score = _largest_component(fallback, prob_map)
+
+    confidence = float(min(1.0, max(score, float(prob_map.max()))))
+    return LocalizationPrediction(probability_map=prob_map, binary_mask=mask.astype(np.uint8), confidence=confidence)
+
+
+
+pipeline.py
+import json
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import asdict, dataclass
+from pathlib import Path
+
+import numpy as np
+from PIL import Image, ImageDraw
+
+try:
+    from .alignment import align_mlo_to_cc
+    from .classification import BiradsClassifier
+    from .correspondence import compute_cross_view_correspondence
+    from .data import ManifestLoader, load_view_data
+    from .detection import detect_lesion_bbox
+    from .segmentation import segment_lesion
+except ImportError:
+    from alignment import align_mlo_to_cc
+    from classification import BiradsClassifier
+    from correspondence import compute_cross_view_correspondence
+    from data import ManifestLoader, load_view_data
+    from detection import detect_lesion_bbox
+    from segmentation import segment_lesion
+
+
+@dataclass
+class ViewStageResult:
+    image_path: str
+    bbox_xywh: list[int] | None
+    detection_confidence: float
+    lesion_center_yx: tuple[int, int]
+    lesion_area: int
+    segmentation_score: float
+
+
+@dataclass
+class SampleStageResult:
+    patient_id: str
+    sample_id: str
+    breast_side: str
+    true_birads: int
+    true_binary_label: int
+    predicted_birads: int
+    predicted_binary_label: int
+    classifier_source: str
+    cc: ViewStageResult
+    mlo: ViewStageResult
+    correspondence: dict
+    alignment: dict
+
+
+class UnifiedMammoPipeline:
+    def __init__(self, manifest_csv: str, classifier_checkpoint: str | None = None, output_dir: str | None = None, device: str | None = None):
+        self.loader = ManifestLoader(manifest_csv)
+        self.classifier = BiradsClassifier(classifier_checkpoint, device=device)
+        base_dir = Path(output_dir) if output_dir else Path(__file__).resolve().parent / "trial_run"
+        self.output_dir = base_dir
+        self.preview_dir = base_dir / "previews"
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.preview_dir.mkdir(parents=True, exist_ok=True)
+
+    def _run_view(self, view_data):
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            seg_future = executor.submit(segment_lesion, view_data.preprocessed_image, view_data.breast_mask)
+            det_future = executor.submit(detect_lesion_bbox, view_data.preprocessed_image, view_data.breast_mask)
+            return seg_future.result(), det_future.result()
+
+    def _overlay(self, image: np.ndarray, seg, det) -> Image.Image:
+        base = np.clip(image * 255.0, 0, 255).astype(np.uint8)
+        rgb = np.stack([base, base, base], axis=-1)
+        rgb[seg.mask > 0] = np.array([255, 120, 0], dtype=np.uint8)
+        pil = Image.fromarray(rgb)
+        draw = ImageDraw.Draw(pil)
+        cy, cx = seg.center_yx
+        draw.ellipse((cx - 20, cy - 20, cx + 20, cy + 20), outline=(0, 255, 255), width=4)
+        if det.bbox_xywh is not None:
+            x, y, w, h = det.bbox_xywh
+            draw.rectangle((x, y, x + w, y + h), outline=(0, 255, 0), width=5)
+        return pil
+
+    def _save_preview(self, sample_id: str, cc_data, mlo_data, cc_seg, mlo_seg, cc_det, mlo_det, aligned_mlo: np.ndarray):
+        cc_overlay = self._overlay(cc_data.preprocessed_image, cc_seg, cc_det).resize((640, 640))
+        mlo_overlay = self._overlay(mlo_data.preprocessed_image, mlo_seg, mlo_det).resize((640, 640))
+        aligned_u8 = np.clip(aligned_mlo * 255.0, 0, 255).astype(np.uint8)
+        aligned_rgb = Image.fromarray(np.stack([aligned_u8, aligned_u8, aligned_u8], axis=-1)).resize((640, 640))
+        fused = Image.blend(cc_overlay.convert("L"), aligned_rgb.convert("L"), 0.5).convert("RGB")
+        canvas = Image.new("RGB", (1280, 1280), color=(0, 0, 0))
+        canvas.paste(cc_overlay, (0, 0))
+        canvas.paste(mlo_overlay, (640, 0))
+        canvas.paste(aligned_rgb, (0, 640))
+        canvas.paste(fused, (640, 640))
+        out_path = self.preview_dir / f"{sample_id}.png"
+        canvas.save(out_path)
+
+    def run(self, limit: int | None = None):
+        results = []
+        for sample in self.loader.load_samples(limit=limit):
+            cc_data = load_view_data(sample.cc_image_path, sample.breast_side)
+            mlo_data = load_view_data(sample.mlo_image_path, sample.breast_side)
+            cc_seg, cc_det = self._run_view(cc_data)
+            mlo_seg, mlo_det = self._run_view(mlo_data)
+
+            corr = compute_cross_view_correspondence(
+                cc_seg.mask,
+                mlo_seg.mask,
+                cc_data.preprocessed_image,
+                mlo_data.preprocessed_image,
+            )
+            alignment = align_mlo_to_cc(
+                cc_data.preprocessed_image,
+                mlo_data.preprocessed_image,
+                cc_seg.mask,
+                mlo_seg.mask,
+            )
+            classification = self.classifier.predict(
+                cc_data.preprocessed_image,
+                alignment.aligned_image,
+                cc_seg.mask,
+                mlo_seg.mask,
+                cc_det.bbox_xywh,
+                mlo_det.bbox_xywh,
+            )
+
+            result = SampleStageResult(
+                patient_id=sample.patient_id,
+                sample_id=sample.sample_id,
+                breast_side=sample.breast_side,
+                true_birads=sample.birads_label,
+                true_binary_label=sample.binary_label,
+                predicted_birads=classification.predicted_birads,
+                predicted_binary_label=classification.predicted_binary_label,
+                classifier_source=classification.source,
+                cc=ViewStageResult(
+                    image_path=sample.cc_image_path,
+                    bbox_xywh=cc_det.bbox_xywh,
+                    detection_confidence=cc_det.confidence,
+                    lesion_center_yx=cc_seg.center_yx,
+                    lesion_area=cc_seg.area,
+                    segmentation_score=cc_seg.score,
+                ),
+                mlo=ViewStageResult(
+                    image_path=sample.mlo_image_path,
+                    bbox_xywh=mlo_det.bbox_xywh,
+                    detection_confidence=mlo_det.confidence,
+                    lesion_center_yx=mlo_seg.center_yx,
+                    lesion_area=mlo_seg.area,
+                    segmentation_score=mlo_seg.score,
+                ),
+                correspondence=corr.to_dict(),
+                alignment=alignment.to_dict(),
+            )
+            results.append((result, classification.ordinal_scores))
+            self._save_preview(sample.sample_id, cc_data, mlo_data, cc_seg, mlo_seg, cc_det, mlo_det, alignment.aligned_image)
+
+        payload = []
+        for result, ordinal_scores in results:
+            item = asdict(result)
+            item["ordinal_scores"] = ordinal_scores
+            payload.append(item)
+        out_path = self.output_dir / "trial_results.json"
+        out_path.write_text(json.dumps(payload, indent=2))
+        return out_path, payload
+
+
+
+pulltext.py
+from pathlib import Path
+
+folder = Path(".")  # change this to your folder path if needed
+output_file = folder / "all_python_files_contents.txt"
+
+py_files = sorted(folder.glob("*.py"))
+
+with output_file.open("w", encoding="utf-8") as out:
+    for i, file_path in enumerate(py_files):
+        content = file_path.read_text(encoding="utf-8", errors="replace")
+        out.write(f"{file_path.name}\n")
+        out.write(content)
+        if i != len(py_files) - 1:
+            out.write("\n\n\n")
+
+print(f"Saved to: {output_file}")
+
+
+
+run_kaggle_full_pipeline.py
+import argparse
+import json
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+from PIL import Image, ImageDraw
+from scipy.ndimage import shift
+from skimage.feature import match_template
+from skimage.transform import resize
+
+try:
+    from unified_mammo_pipeline.alignment import align_mlo_to_cc
+    from unified_mammo_pipeline.classification import BiradsClassifier, birads_to_binary_label
+    from unified_mammo_pipeline.correspondence import compute_cross_view_correspondence
+    from unified_mammo_pipeline.data import extract_breast_mask, load_grayscale_image, preprocess_mammogram
+    from unified_mammo_pipeline.detection import detect_lesion_bbox
+    from unified_mammo_pipeline.segmentation import segment_lesion
+except ImportError:
+    from alignment import align_mlo_to_cc
+    from classification import BiradsClassifier, birads_to_binary_label
+    from correspondence import compute_cross_view_correspondence
+    from data import extract_breast_mask, load_grayscale_image, preprocess_mammogram
+    from detection import detect_lesion_bbox
+    from segmentation import segment_lesion
+
+
+def classification_accuracy(y_true: list[int], y_pred: list[int]) -> float | None:
+    if not y_true:
+        return None
+    return float(sum(int(a == b) for a, b in zip(y_true, y_pred)) / len(y_true))
+
+
+def weighted_f1(y_true: list[int], y_pred: list[int]) -> float | None:
+    if not y_true:
+        return None
+    labels = sorted(set(y_true) | set(y_pred))
+    total = len(y_true)
+    score = 0.0
+    for label in labels:
+        tp = sum(1 for yt, yp in zip(y_true, y_pred) if yt == label and yp == label)
+        fp = sum(1 for yt, yp in zip(y_true, y_pred) if yt != label and yp == label)
+        fn = sum(1 for yt, yp in zip(y_true, y_pred) if yt == label and yp != label)
+        support = sum(1 for yt in y_true if yt == label)
+        precision = tp / (tp + fp) if (tp + fp) else 0.0
+        recall = tp / (tp + fn) if (tp + fn) else 0.0
+        f1 = (2 * precision * recall / (precision + recall)) if (precision + recall) else 0.0
+        score += f1 * support
+    return float(score / total)
+
+
+def confusion_matrix_list(y_true: list[int], y_pred: list[int]) -> list[list[int]]:
+    if not y_true:
+        return []
+    labels = sorted(set(y_true) | set(y_pred))
+    idx = {label: i for i, label in enumerate(labels)}
+    matrix = [[0 for _ in labels] for _ in labels]
+    for yt, yp in zip(y_true, y_pred):
+        matrix[idx[yt]][idx[yp]] += 1
+    return matrix
+
+
+CSV_FILES = [
+    "mass_case_description_train_set.csv",
+    "calc_case_description_train_set.csv",
+    "mass_case_description_test_set.csv",
+    "calc_case_description_test_set.csv",
+]
+
+
+def default_classifier_checkpoint() -> str:
+    root = Path(__file__).resolve().parents[1]
+    candidates = [
+        root / "output" / "cnn_attentional_weights.pth",
+        root / "unified-init" / "output" / "cnn_attentional_weights.pth",
+        root / "raw-5" / "output" / "cnn_attentional_weights.pth",
+        root / "raw-4" / "output" / "cnn_attentional_weights.pth",
+        root / "raw-4-og" / "output" / "cnn_attentional_weights.pth",
+    ]
+    for path in candidates:
+        if path.exists():
+            return str(path)
+    return str(candidates[0])
+
+
+def parse_args():
+    base_dir = Path("/home/sofa/host_dir/spatial_alignment/dataset/raw/cbisddsm-kaggle")
+    parser = argparse.ArgumentParser(description="Full unified pipeline on the CBIS-DDSM Kaggle dataset")
+    parser.add_argument("--dataset-base", default=str(base_dir))
+    parser.add_argument("--manifest-csv", default=None)
+    parser.add_argument("--classifier-checkpoint", default=default_classifier_checkpoint())
+    parser.add_argument("--output-dir", default=str(Path(__file__).resolve().parent / "kaggle_full_run"))
+    parser.add_argument("--limit", type=int, default=2)
+    parser.add_argument("--max-long-side", type=int, default=1536)
+    parser.add_argument("--device", default=None)
+    return parser.parse_args()
+
+
+def build_uid_index(jpeg_root: Path):
+    index = {}
+    for folder in jpeg_root.iterdir():
+        if folder.is_dir():
+            index[folder.name] = sorted(folder.glob("*.jpg"))
+    return index
+
+
+def resolve_from_dicom_path(path_str: str, uid_index: dict[str, list[Path]], prefer_prefix: str) -> Path | None:
+    parts = str(path_str).strip().replace("\\", "/").split("/")
+    for part in parts:
+        if part in uid_index:
+            files = uid_index[part]
+            preferred = [f for f in files if f.name.startswith(prefer_prefix)]
+            if preferred:
+                return preferred[0]
+            if files:
+                return files[0]
+    return None
+
+
+def resolve_roi_assets(
+    cropped_path_str: str,
+    roi_path_str: str,
+    uid_index: dict[str, list[Path]],
+    asset_cache: dict[str, tuple[Path | None, Path | None]],
+) -> tuple[Path | None, Path | None]:
+    parts = f"{cropped_path_str}/{roi_path_str}".strip().replace("\\", "/").split("/")
+    roi_uid = next((part for part in parts if part in uid_index), None)
+    if roi_uid is None:
+        return None, None
+    if roi_uid in asset_cache:
+        return asset_cache[roi_uid]
+
+    files = uid_index[roi_uid]
+    if not files:
+        asset_cache[roi_uid] = (None, None)
+        return asset_cache[roi_uid]
+    if len(files) == 1:
+        asset_cache[roi_uid] = (None, files[0])
+        return asset_cache[roi_uid]
+
+    scored = []
+    for path in files:
+        image = np.array(Image.open(path).convert("L"), dtype=np.uint8)
+        nonzero_ratio = float((image > 10).mean())
+        scored.append((nonzero_ratio, path))
+    scored.sort(key=lambda item: item[0])
+
+    mask_path = scored[0][1]
+    crop_path = scored[-1][1] if len(scored) > 1 else None
+    asset_cache[roi_uid] = (crop_path, mask_path)
+    return asset_cache[roi_uid]
+
+
+def build_kaggle_manifest(dataset_base: Path, output_dir: Path, pair_limit: int | None = None) -> pd.DataFrame:
+    csv_root = dataset_base / "csv"
+    jpeg_root = dataset_base / "jpeg"
+    uid_index = build_uid_index(jpeg_root)
+    roi_asset_cache: dict[str, tuple[Path | None, Path | None]] = {}
+
+    grouped = {}
+    completed_patient_sides = set()
+    stop_early = False
+    for name in CSV_FILES:
+        csv_path = csv_root / name
+        if not csv_path.exists():
+            continue
+        df = pd.read_csv(csv_path)
+        df.columns = df.columns.str.strip()
+        for _, row in df.iterrows():
+            image_path = resolve_from_dicom_path(row.get("image file path", ""), uid_index, prefer_prefix="1-")
+            cropped_image_path, roi_mask_path = resolve_roi_assets(
+                row.get("cropped image file path", ""),
+                row.get("ROI mask file path", ""),
+                uid_index,
+                roi_asset_cache,
+            )
+            if image_path is None:
+                continue
+            patient_id = str(row.get("patient_id", "")).strip()
+            breast_side = str(row.get("left or right breast", "")).strip().upper()
+            view = str(row.get("image view", "")).strip().upper()
+            key = (patient_id, breast_side, view)
+            grouped.setdefault(
+                key,
+                {
+                    "image_path": str(image_path),
+                    "roi_entries": [],
+                    "birads": [],
+                    "pathology": [],
+                    "abnormality_type": [],
+                },
+            )
+            if roi_mask_path:
+                grouped[key]["roi_entries"].append(
+                {
+                    "mask_path": str(roi_mask_path),
+                    "crop_path": str(cropped_image_path) if cropped_image_path else "",
+                }
+            )
+            grouped[key]["birads"].append(int(row.get("assessment", 0)))
+            pathology = str(row.get("pathology", "")).strip()
+            abnormality_type = str(row.get("abnormality type", "")).strip()
+            if pathology:
+                grouped[key]["pathology"].append(pathology)
+            if abnormality_type:
+                grouped[key]["abnormality_type"].append(abnormality_type)
+
+            patient_side = (patient_id, breast_side)
+            if pair_limit:
+                if grouped.get((patient_id, breast_side, "CC")) and grouped.get((patient_id, breast_side, "MLO")):
+                    completed_patient_sides.add(patient_side)
+                if len(completed_patient_sides) >= pair_limit:
+                    stop_early = True
+                    break
+        if stop_early:
+            break
+
+    paired_rows = []
+    patient_side_keys = sorted(completed_patient_sides or {(patient_id, side) for patient_id, side, _ in grouped.keys()})
+    for patient_id, side in patient_side_keys:
+        cc = grouped.get((patient_id, side, "CC"))
+        mlo = grouped.get((patient_id, side, "MLO"))
+        if not cc or not mlo:
+            continue
+        sample_id = f"{patient_id}_{side}"
+        paired_rows.append(
+            {
+                "patient_id": patient_id,
+                "sample_id": sample_id,
+                "breast_side": side,
+                "birads_label": int(max(cc["birads"] + mlo["birads"])),
+                "binary_label": birads_to_binary_label(int(max(cc["birads"] + mlo["birads"]))),
+                "cc_image_path": cc["image_path"],
+                "mlo_image_path": mlo["image_path"],
+                "cc_roi_entries": json.dumps(cc["roi_entries"]),
+                "mlo_roi_entries": json.dumps(mlo["roi_entries"]),
+                "pathology": ";".join(sorted(set(cc["pathology"] + mlo["pathology"]))),
+                "abnormality_type": ";".join(sorted(set(cc["abnormality_type"] + mlo["abnormality_type"]))),
+            }
+        )
+
+    manifest = pd.DataFrame(paired_rows)
+    manifest_path = output_dir / "paired_kaggle_manifest.csv"
+    manifest.to_csv(manifest_path, index=False)
+    return manifest
+
+
+def resize_long_side(image: np.ndarray, max_long_side: int) -> np.ndarray:
+    h, w = image.shape
+    long_side = max(h, w)
+    if long_side <= max_long_side:
+        return image.astype(np.float32)
+    scale = max_long_side / long_side
+    new_h = max(1, int(round(h * scale)))
+    new_w = max(1, int(round(w * scale)))
+    pil = Image.fromarray(np.clip(image * 255.0, 0, 255).astype(np.uint8))
+    resized = pil.resize((new_w, new_h), Image.Resampling.BILINEAR)
+    return np.array(resized, dtype=np.float32) / 255.0
+
+
+def _resize_to_shape(image: np.ndarray, shape: tuple[int, int], nearest: bool = False) -> np.ndarray:
+    if image.shape == shape:
+        return image.astype(np.float32)
+    order = 0 if nearest else 1
+    anti_aliasing = not nearest
+    return resize(image, shape, preserve_range=True, order=order, anti_aliasing=anti_aliasing).astype(np.float32)
+
+
+def place_crop_mask_in_full_image(full_image: np.ndarray, crop_image: np.ndarray, crop_mask: np.ndarray) -> np.ndarray:
+    crop_h, crop_w = crop_image.shape
+    full_h, full_w = full_image.shape
+    placed = np.zeros((full_h, full_w), dtype=np.uint8)
+    if crop_h == 0 or crop_w == 0 or crop_h > full_h or crop_w > full_w:
+        return placed
+
+    response = match_template(full_image.astype(np.float32), crop_image.astype(np.float32), pad_input=False)
+    if response.size == 0:
+        return placed
+    y, x = np.unravel_index(int(np.argmax(response)), response.shape)
+    y2 = min(full_h, y + crop_h)
+    x2 = min(full_w, x + crop_w)
+    placed[y:y2, x:x2] = (crop_mask[: y2 - y, : x2 - x] > 0.5).astype(np.uint8)
+    return placed
+
+
+def load_roi_union(
+    roi_entries_json: str,
+    breast_side: str,
+    full_image: np.ndarray,
+    full_image_original_shape: tuple[int, int],
+) -> np.ndarray:
+    roi_entries = json.loads(roi_entries_json) if roi_entries_json else []
+    target_shape = full_image.shape
+    union = np.zeros(target_shape, dtype=np.uint8)
+    scale_y = target_shape[0] / max(full_image_original_shape[0], 1)
+    scale_x = target_shape[1] / max(full_image_original_shape[1], 1)
+
+    for entry in roi_entries:
+        mask_path = entry.get("mask_path", "")
+        crop_path = entry.get("crop_path", "")
+        if not mask_path:
+            continue
+
+        mask_img = load_grayscale_image(mask_path, flip_right=breast_side == "RIGHT")
+        if mask_img.shape == full_image_original_shape:
+            full_mask = _resize_to_shape(mask_img, target_shape, nearest=True)
+            union = np.maximum(union, (full_mask > 0.5).astype(np.uint8))
+            continue
+
+        if not crop_path:
+            fallback_mask = _resize_to_shape(mask_img, target_shape, nearest=True)
+            union = np.maximum(union, (fallback_mask > 0.5).astype(np.uint8))
+            continue
+
+        crop_img = load_grayscale_image(crop_path, flip_right=breast_side == "RIGHT")
+        if crop_img.shape != mask_img.shape:
+            mask_img = _resize_to_shape(mask_img, crop_img.shape, nearest=True)
+
+        resized_crop_shape = (
+            max(1, int(round(crop_img.shape[0] * scale_y))),
+            max(1, int(round(crop_img.shape[1] * scale_x))),
+        )
+        crop_resized = _resize_to_shape(crop_img, resized_crop_shape, nearest=False)
+        mask_resized = _resize_to_shape(mask_img, resized_crop_shape, nearest=True)
+        placed = place_crop_mask_in_full_image(full_image, crop_resized, mask_resized)
+        union = np.maximum(union, placed)
+    return union
+
+
+def bbox_to_mask(bbox: list[int] | None, shape: tuple[int, int]) -> np.ndarray:
+    mask = np.zeros(shape, dtype=np.uint8)
+    if bbox is None:
+        return mask
+    x, y, w, h = bbox
+    x1 = max(0, x)
+    y1 = max(0, y)
+    x2 = min(shape[1], x + w)
+    y2 = min(shape[0], y + h)
+    if x2 > x1 and y2 > y1:
+        mask[y1:y2, x1:x2] = 1
+    return mask
+
+
+def dice_score(a: np.ndarray, b: np.ndarray) -> float:
+    a = a.astype(bool)
+    b = b.astype(bool)
+    denom = a.sum() + b.sum()
+    if denom == 0:
+        return 1.0
+    return float((2.0 * np.logical_and(a, b).sum()) / denom)
+
+
+def iou_score(a: np.ndarray, b: np.ndarray) -> float:
+    a = a.astype(bool)
+    b = b.astype(bool)
+    union = np.logical_or(a, b).sum()
+    if union == 0:
+        return 1.0
+    return float(np.logical_and(a, b).sum() / union)
+
+
+def precision_recall(pred: np.ndarray, target: np.ndarray) -> tuple[float, float]:
+    pred = pred.astype(bool)
+    target = target.astype(bool)
+    tp = np.logical_and(pred, target).sum()
+    precision = float(tp / pred.sum()) if pred.sum() else 0.0
+    recall = float(tp / target.sum()) if target.sum() else 0.0
+    return precision, recall
+
+
+def center_distance(mask_a: np.ndarray, mask_b: np.ndarray) -> float:
+    ay, ax = np.where(mask_a > 0)
+    by, bx = np.where(mask_b > 0)
+    if len(ay) == 0 or len(by) == 0:
+        return float("nan")
+    return float(np.sqrt((ax.mean() - bx.mean()) ** 2 + (ay.mean() - by.mean()) ** 2))
+
+
+def overlay_detection(image: np.ndarray, bbox: list[int] | None, out_path: Path):
+    base = np.clip(image * 255.0, 0, 255).astype(np.uint8)
+    pil = Image.fromarray(np.stack([base, base, base], axis=-1))
+    draw = ImageDraw.Draw(pil)
+    if bbox is not None:
+        x, y, w, h = bbox
+        draw.rectangle((x, y, x + w, y + h), outline=(0, 255, 0), width=4)
+    pil.save(out_path)
+
+
+def overlay_segmentation(image: np.ndarray, mask: np.ndarray, out_path: Path):
+    base = np.clip(image * 255.0, 0, 255).astype(np.uint8)
+    rgb = np.stack([base, base, base], axis=-1)
+    rgb[mask > 0] = np.array([255, 120, 0], dtype=np.uint8)
+    Image.fromarray(rgb).save(out_path)
+
+
+def overlay_gt_comparison(image: np.ndarray, pred_mask: np.ndarray, gt_mask: np.ndarray, out_path: Path):
+    base = np.clip(image * 255.0, 0, 255).astype(np.uint8)
+    rgb = np.stack([base, base, base], axis=-1)
+    # Green marks GT-only pixels, orange marks prediction-only pixels, red marks overlap.
+    pred = pred_mask > 0
+    gt = gt_mask > 0
+    overlap = pred & gt
+    pred_only = pred & ~gt
+    gt_only = gt & ~pred
+    rgb[gt_only] = np.array([0, 255, 0], dtype=np.uint8)
+    rgb[pred_only] = np.array([255, 120, 0], dtype=np.uint8)
+    rgb[overlap] = np.array([255, 0, 0], dtype=np.uint8)
+    Image.fromarray(rgb).save(out_path)
+
+
+def save_alignment_overlay(cc_image: np.ndarray, aligned_mlo: np.ndarray, out_path: Path):
+    cc = Image.fromarray(np.clip(cc_image * 255.0, 0, 255).astype(np.uint8)).convert("L")
+    mlo = Image.fromarray(np.clip(aligned_mlo * 255.0, 0, 255).astype(np.uint8)).convert("L")
+    Image.blend(cc, mlo, 0.5).convert("RGB").save(out_path)
+
+
+def main():
+    args = parse_args()
+    dataset_base = Path(args.dataset_base)
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    for name in ["manifests", "detection", "segmentation", "gt_comparison", "alignment", "correspondence", "classification", "metrics"]:
+        (output_dir / name).mkdir(parents=True, exist_ok=True)
+
+    if args.manifest_csv:
+        manifest = pd.read_csv(args.manifest_csv)
+        if "binary_label" not in manifest.columns:
+            manifest = manifest.copy()
+            manifest["binary_label"] = manifest["birads_label"].map(birads_to_binary_label)
+        (output_dir / "manifests" / "paired_kaggle_manifest.csv").write_text(manifest.to_csv(index=False))
+    else:
+        manifest = build_kaggle_manifest(dataset_base, output_dir / "manifests", pair_limit=args.limit)
+        if args.limit:
+            manifest = manifest.iloc[: args.limit].copy()
+
+    classifier = BiradsClassifier(args.classifier_checkpoint, device=args.device)
+    per_sample = []
+    y_true = []
+    y_pred = []
+
+    for _, row in manifest.iterrows():
+        side = str(row["breast_side"]).strip().upper()
+        sample_id = str(row["sample_id"])
+
+        cc_raw_original = load_grayscale_image(row["cc_image_path"], flip_right=side == "RIGHT")
+        mlo_raw_original = load_grayscale_image(row["mlo_image_path"], flip_right=side == "RIGHT")
+        cc_raw = resize_long_side(cc_raw_original, args.max_long_side)
+        mlo_raw = resize_long_side(mlo_raw_original, args.max_long_side)
+        cc_gt_mask = load_roi_union(row["cc_roi_entries"], side, cc_raw, cc_raw_original.shape)
+        mlo_gt_mask = load_roi_union(row["mlo_roi_entries"], side, mlo_raw, mlo_raw_original.shape)
+
+        cc_img = preprocess_mammogram(cc_raw)
+        mlo_img = preprocess_mammogram(mlo_raw)
+        cc_breast = extract_breast_mask(cc_img)
+        mlo_breast = extract_breast_mask(mlo_img)
+
+        cc_seg = segment_lesion(cc_img, cc_breast)
+        cc_det = detect_lesion_bbox(cc_img, cc_breast)
+        mlo_seg = segment_lesion(mlo_img, mlo_breast)
+        mlo_det = detect_lesion_bbox(mlo_img, mlo_breast)
+
+        correspondence = compute_cross_view_correspondence(cc_seg.mask, mlo_seg.mask, cc_img, mlo_img)
+        alignment = align_mlo_to_cc(cc_img, mlo_img, cc_seg.mask, mlo_seg.mask)
+
+        mlo_seg_resized = resize(mlo_seg.mask.astype(np.float32), cc_seg.mask.shape, preserve_range=True, order=0, anti_aliasing=False) > 0.5
+        aligned_mlo_mask = shift(mlo_seg_resized.astype(np.float32), shift=(alignment.affine_matrix[1][2], alignment.affine_matrix[0][2]), order=0, mode="constant", cval=0.0) > 0.5
+
+        cls = classifier.predict(cc_img, alignment.aligned_image, cc_seg.mask, aligned_mlo_mask.astype(np.uint8), cc_det.bbox_xywh, mlo_det.bbox_xywh)
+
+        y_true.append(int(row["binary_label"]))
+        y_pred.append(int(cls.predicted_binary_label))
+
+        cc_det_mask = bbox_to_mask(cc_det.bbox_xywh, cc_seg.mask.shape)
+        mlo_det_mask = bbox_to_mask(mlo_det.bbox_xywh, mlo_seg.mask.shape)
+        cc_precision, cc_recall = precision_recall(cc_seg.mask, cc_gt_mask)
+        mlo_precision, mlo_recall = precision_recall(mlo_seg.mask, mlo_gt_mask)
+
+        sample_metrics = {
+            "sample_id": sample_id,
+            "patient_id": row["patient_id"],
+            "true_birads": int(row["birads_label"]),
+            "true_binary_label": int(row["binary_label"]),
+            "predicted_birads": int(cls.predicted_birads),
+            "predicted_binary_label": int(cls.predicted_binary_label),
+            "classifier_source": cls.source,
+            "cc_seg_dice_vs_roi": dice_score(cc_seg.mask, cc_gt_mask),
+            "cc_seg_iou_vs_roi": iou_score(cc_seg.mask, cc_gt_mask),
+            "cc_seg_precision_vs_roi": cc_precision,
+            "cc_seg_recall_vs_roi": cc_recall,
+            "mlo_seg_dice_vs_roi": dice_score(mlo_seg.mask, mlo_gt_mask),
+            "mlo_seg_iou_vs_roi": iou_score(mlo_seg.mask, mlo_gt_mask),
+            "mlo_seg_precision_vs_roi": mlo_precision,
+            "mlo_seg_recall_vs_roi": mlo_recall,
+            "cc_det_seg_iou": iou_score(cc_det_mask, cc_seg.mask),
+            "mlo_det_seg_iou": iou_score(mlo_det_mask, mlo_seg.mask),
+            "cc_detection_confidence": float(cc_det.confidence),
+            "mlo_detection_confidence": float(mlo_det.confidence),
+            "correspondence_centroid_distance_px": float(correspondence.centroid_distance_px),
+            "alignment_dice_before": dice_score(cc_seg.mask, mlo_seg_resized),
+            "alignment_dice_after": dice_score(cc_seg.mask, aligned_mlo_mask),
+            "alignment_centroid_distance_before": center_distance(cc_seg.mask, mlo_seg_resized),
+            "alignment_centroid_distance_after": center_distance(cc_seg.mask, aligned_mlo_mask),
+        }
+        per_sample.append(sample_metrics)
+
+        overlay_detection(cc_img, cc_det.bbox_xywh, output_dir / "detection" / f"{sample_id}_CC_detection.png")
+        overlay_detection(mlo_img, mlo_det.bbox_xywh, output_dir / "detection" / f"{sample_id}_MLO_detection.png")
+        overlay_segmentation(cc_img, cc_seg.mask, output_dir / "segmentation" / f"{sample_id}_CC_segmentation.png")
+        overlay_segmentation(mlo_img, mlo_seg.mask, output_dir / "segmentation" / f"{sample_id}_MLO_segmentation.png")
+        overlay_gt_comparison(cc_img, cc_seg.mask, cc_gt_mask, output_dir / "gt_comparison" / f"{sample_id}_CC_gt_comparison.png")
+        overlay_gt_comparison(mlo_img, mlo_seg.mask, mlo_gt_mask, output_dir / "gt_comparison" / f"{sample_id}_MLO_gt_comparison.png")
+        save_alignment_overlay(cc_img, alignment.aligned_image, output_dir / "alignment" / f"{sample_id}_alignment_overlay.png")
+        (output_dir / "correspondence" / f"{sample_id}_correspondence.json").write_text(json.dumps(correspondence.to_dict(), indent=2))
+        (output_dir / "classification" / f"{sample_id}_classification.json").write_text(
+            json.dumps(
+                {
+                    "sample_id": sample_id,
+                    "true_birads": int(row["birads_label"]),
+                    "true_binary_label": int(row["binary_label"]),
+                    "predicted_birads": int(cls.predicted_birads),
+                    "predicted_binary_label": int(cls.predicted_binary_label),
+                    "ordinal_scores": cls.ordinal_scores,
+                    "source": cls.source,
+                },
+                indent=2,
+            )
+        )
+
+    per_sample_df = pd.DataFrame(per_sample)
+    per_sample_df.to_csv(output_dir / "metrics" / "per_sample_metrics.csv", index=False)
+
+    aggregate = {
+        "dataset_base": str(dataset_base),
+        "num_samples": int(len(per_sample_df)),
+        "classification_target": "binary_birads_0_3_vs_4_5",
+        "classification_accuracy": classification_accuracy(y_true, y_pred),
+        "classification_f1_weighted": weighted_f1(y_true, y_pred),
+        "classification_confusion_matrix": confusion_matrix_list(y_true, y_pred),
+        "mean_cc_seg_dice_vs_roi": float(per_sample_df["cc_seg_dice_vs_roi"].mean()) if not per_sample_df.empty else None,
+        "mean_mlo_seg_dice_vs_roi": float(per_sample_df["mlo_seg_dice_vs_roi"].mean()) if not per_sample_df.empty else None,
+        "mean_cc_det_seg_iou": float(per_sample_df["cc_det_seg_iou"].mean()) if not per_sample_df.empty else None,
+        "mean_mlo_det_seg_iou": float(per_sample_df["mlo_det_seg_iou"].mean()) if not per_sample_df.empty else None,
+        "mean_alignment_dice_before": float(per_sample_df["alignment_dice_before"].mean()) if not per_sample_df.empty else None,
+        "mean_alignment_dice_after": float(per_sample_df["alignment_dice_after"].mean()) if not per_sample_df.empty else None,
+        "mean_alignment_centroid_distance_before": float(per_sample_df["alignment_centroid_distance_before"].dropna().mean()) if not per_sample_df.empty else None,
+        "mean_alignment_centroid_distance_after": float(per_sample_df["alignment_centroid_distance_after"].dropna().mean()) if not per_sample_df.empty else None,
+    }
+    (output_dir / "metrics" / "aggregate_metrics.json").write_text(json.dumps(aggregate, indent=2))
+    print(json.dumps(aggregate, indent=2))
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+run_trial.py
+import argparse
+from pathlib import Path
+
+try:
+    from unified_mammo_pipeline.pipeline import UnifiedMammoPipeline
+except ImportError:
+    from pipeline import UnifiedMammoPipeline
+
+
+def default_classifier_checkpoint() -> str:
+    root = Path(__file__).resolve().parents[1]
+    candidates = [
+        root / "output" / "cnn_attentional_weights.pth",
+        root / "unified-init" / "output" / "cnn_attentional_weights.pth",
+        root / "raw-5" / "output" / "cnn_attentional_weights.pth",
+        root / "raw-4" / "output" / "cnn_attentional_weights.pth",
+        root / "raw-4-og" / "output" / "cnn_attentional_weights.pth",
+    ]
+    for path in candidates:
+        if path.exists():
+            return str(path)
+    return str(candidates[0])
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Run the unified mammography pipeline trial")
+    parser.add_argument("--manifest-csv", default=str(Path(__file__).resolve().parents[1] / "dicom_clean_train.csv"))
+    parser.add_argument("--classifier-checkpoint", default=default_classifier_checkpoint())
+    parser.add_argument("--output-dir", default=str(Path(__file__).resolve().parent / "trial_run"))
+    parser.add_argument("--limit", type=int, default=2)
+    parser.add_argument("--device", default=None)
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+    pipeline = UnifiedMammoPipeline(
+        manifest_csv=args.manifest_csv,
+        classifier_checkpoint=args.classifier_checkpoint,
+        output_dir=args.output_dir,
+        device=args.device,
+    )
+    out_path, payload = pipeline.run(limit=args.limit)
+    print(f"Saved {len(payload)} trial results to {out_path}")
+    if payload:
+        first = payload[0]
+        print(
+            f"First sample: {first['sample_id']} | true_birads={first['true_birads']} | "
+            f"true_binary={first['true_binary_label']} | pred_birads={first['predicted_birads']} | "
+            f"pred_binary={first['predicted_binary_label']} | source={first['classifier_source']}"
+        )
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+run_unified_binary_pipeline.py
+import argparse
+import json
+from pathlib import Path
+
+import pandas as pd
+from scipy.ndimage import shift
+from skimage.transform import resize
+
+try:
+    from unified_mammo_pipeline.alignment import align_mlo_to_cc
+    from unified_mammo_pipeline.classification import BiradsClassifier, birads_to_binary_label
+    from unified_mammo_pipeline.correspondence import compute_cross_view_correspondence
+    from unified_mammo_pipeline.data import extract_breast_mask, load_grayscale_image, preprocess_mammogram
+    from unified_mammo_pipeline.detection import detect_lesion_bbox
+    from unified_mammo_pipeline.segmentation import segment_lesion
+    from unified_mammo_pipeline.run_kaggle_full_pipeline import (
+        bbox_to_mask,
+        build_kaggle_manifest,
+        center_distance,
+        default_classifier_checkpoint,
+        dice_score,
+        iou_score,
+        load_roi_union,
+        overlay_detection,
+        overlay_gt_comparison,
+        overlay_segmentation,
+        precision_recall,
+        resize_long_side,
+        save_alignment_overlay,
+    )
+except ImportError:
+    from alignment import align_mlo_to_cc
+    from classification import BiradsClassifier, birads_to_binary_label
+    from correspondence import compute_cross_view_correspondence
+    from data import extract_breast_mask, load_grayscale_image, preprocess_mammogram
+    from detection import detect_lesion_bbox
+    from segmentation import segment_lesion
+    from run_kaggle_full_pipeline import (
+        bbox_to_mask,
+        build_kaggle_manifest,
+        center_distance,
+        default_classifier_checkpoint,
+        dice_score,
+        iou_score,
+        load_roi_union,
+        overlay_detection,
+        overlay_gt_comparison,
+        overlay_segmentation,
+        precision_recall,
+        resize_long_side,
+        save_alignment_overlay,
+    )
+
+
+LABEL_NAMES = {
+    0: 'birads_0_1_2_3',
+    1: 'birads_4_5',
+}
+
+
+def parse_args():
+    base_dir = Path('/home/sofa/host_dir/spatial_alignment/dataset/raw/cbisddsm-kaggle')
+    parser = argparse.ArgumentParser(
+        description='Unified mammography pipeline with segmentation, detection, alignment, and binary BI-RADS classification'
+    )
+    parser.add_argument('--dataset-base', default=str(base_dir))
+    parser.add_argument('--manifest-csv', default=None)
+    parser.add_argument('--classifier-checkpoint', default=default_classifier_checkpoint())
+    parser.add_argument('--output-dir', default=str(Path(__file__).resolve().parent / 'binary_full_run'))
+    parser.add_argument('--limit', type=int, default=None)
+    parser.add_argument('--max-long-side', type=int, default=1536)
+    parser.add_argument('--device', default=None)
+    return parser.parse_args()
+
+
+def safe_div(numerator: float, denominator: float) -> float:
+    return float(numerator / denominator) if denominator else 0.0
+
+
+def compute_binary_classification_metrics(y_true: list[int], y_pred: list[int]) -> dict:
+    labels = [0, 1]
+    matrix = [[0, 0], [0, 0]]
+    for yt, yp in zip(y_true, y_pred):
+        matrix[int(yt)][int(yp)] += 1
+
+    total = len(y_true)
+    correct = matrix[0][0] + matrix[1][1]
+    class_metrics = {}
+    recalls = []
+    f1s = []
+    weighted_f1_sum = 0.0
+
+    for label in labels:
+        tp = matrix[label][label]
+        fp = sum(matrix[row][label] for row in labels if row != label)
+        fn = sum(matrix[label][col] for col in labels if col != label)
+        tn = total - tp - fp - fn
+        support = sum(matrix[label])
+        predicted_count = matrix[0][label] + matrix[1][label]
+
+        precision = safe_div(tp, tp + fp)
+        recall = safe_div(tp, tp + fn)
+        specificity = safe_div(tn, tn + fp)
+        npv = safe_div(tn, tn + fn)
+        f1 = safe_div(2.0 * precision * recall, precision + recall) if (precision + recall) else 0.0
+        prevalence = safe_div(support, total)
+
+        recalls.append(recall)
+        f1s.append(f1)
+        weighted_f1_sum += f1 * support
+        class_metrics[str(label)] = {
+            'label_name': LABEL_NAMES[label],
+            'support': int(support),
+            'predicted_count': int(predicted_count),
+            'tp': int(tp),
+            'fp': int(fp),
+            'fn': int(fn),
+            'tn': int(tn),
+            'precision': precision,
+            'recall': recall,
+            'specificity': specificity,
+            'npv': npv,
+            'f1': f1,
+            'prevalence': prevalence,
+        }
+
+    return {
+        'labels': labels,
+        'label_names': [LABEL_NAMES[label] for label in labels],
+        'confusion_matrix': matrix,
+        'num_samples': int(total),
+        'accuracy': safe_div(correct, total),
+        'balanced_accuracy': float(sum(recalls) / len(recalls)) if recalls else 0.0,
+        'macro_f1': float(sum(f1s) / len(f1s)) if f1s else 0.0,
+        'weighted_f1': safe_div(weighted_f1_sum, total),
+        'class_metrics': class_metrics,
+    }
+
+
+def ensure_binary_manifest(manifest: pd.DataFrame) -> pd.DataFrame:
+    if 'binary_label' in manifest.columns:
+        return manifest
+    manifest = manifest.copy()
+    manifest['binary_label'] = manifest['birads_label'].map(birads_to_binary_label)
+    return manifest
+
+
+def main():
+    args = parse_args()
+    dataset_base = Path(args.dataset_base)
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    for name in ['manifests', 'detection', 'segmentation', 'gt_comparison', 'alignment', 'correspondence', 'classification', 'metrics']:
+        (output_dir / name).mkdir(parents=True, exist_ok=True)
+
+    if args.manifest_csv:
+        manifest = ensure_binary_manifest(pd.read_csv(args.manifest_csv))
+        if args.limit:
+            manifest = manifest.iloc[: args.limit].copy()
+        (output_dir / 'manifests' / 'paired_kaggle_manifest.csv').write_text(manifest.to_csv(index=False))
+    else:
+        manifest = build_kaggle_manifest(dataset_base, output_dir / 'manifests', pair_limit=args.limit)
+        if args.limit:
+            manifest = manifest.iloc[: args.limit].copy()
+
+    classifier = BiradsClassifier(args.classifier_checkpoint, device=args.device)
+    per_sample = []
+    y_true = []
+    y_pred = []
+
+    for _, row in manifest.iterrows():
+        side = str(row['breast_side']).strip().upper()
+        sample_id = str(row['sample_id'])
+
+        cc_raw_original = load_grayscale_image(row['cc_image_path'], flip_right=side == 'RIGHT')
+        mlo_raw_original = load_grayscale_image(row['mlo_image_path'], flip_right=side == 'RIGHT')
+        cc_raw = resize_long_side(cc_raw_original, args.max_long_side)
+        mlo_raw = resize_long_side(mlo_raw_original, args.max_long_side)
+        cc_gt_mask = load_roi_union(row['cc_roi_entries'], side, cc_raw, cc_raw_original.shape)
+        mlo_gt_mask = load_roi_union(row['mlo_roi_entries'], side, mlo_raw, mlo_raw_original.shape)
+
+        cc_img = preprocess_mammogram(cc_raw)
+        mlo_img = preprocess_mammogram(mlo_raw)
+        cc_breast = extract_breast_mask(cc_img)
+        mlo_breast = extract_breast_mask(mlo_img)
+
+        cc_seg = segment_lesion(cc_img, cc_breast)
+        cc_det = detect_lesion_bbox(cc_img, cc_breast)
+        mlo_seg = segment_lesion(mlo_img, mlo_breast)
+        mlo_det = detect_lesion_bbox(mlo_img, mlo_breast)
+
+        correspondence = compute_cross_view_correspondence(cc_seg.mask, mlo_seg.mask, cc_img, mlo_img)
+        alignment = align_mlo_to_cc(cc_img, mlo_img, cc_seg.mask, mlo_seg.mask)
+
+        mlo_seg_resized = resize(
+            mlo_seg.mask.astype(float),
+            cc_seg.mask.shape,
+            preserve_range=True,
+            order=0,
+            anti_aliasing=False,
+        ) > 0.5
+        aligned_mlo_mask = shift(
+            mlo_seg_resized.astype(float),
+            shift=(alignment.affine_matrix[1][2], alignment.affine_matrix[0][2]),
+            order=0,
+            mode='constant',
+            cval=0.0,
+        ) > 0.5
+
+        cls = classifier.predict(
+            cc_img,
+            alignment.aligned_image,
+            cc_seg.mask,
+            aligned_mlo_mask.astype('uint8'),
+            cc_det.bbox_xywh,
+            mlo_det.bbox_xywh,
+        )
+
+        true_binary = int(row['binary_label'])
+        pred_binary = int(cls.predicted_binary_label)
+        y_true.append(true_binary)
+        y_pred.append(pred_binary)
+
+        cc_det_mask = bbox_to_mask(cc_det.bbox_xywh, cc_seg.mask.shape)
+        mlo_det_mask = bbox_to_mask(mlo_det.bbox_xywh, mlo_seg.mask.shape)
+        cc_precision, cc_recall = precision_recall(cc_seg.mask, cc_gt_mask)
+        mlo_precision, mlo_recall = precision_recall(mlo_seg.mask, mlo_gt_mask)
+
+        sample_metrics = {
+            'sample_id': sample_id,
+            'patient_id': row['patient_id'],
+            'true_birads': int(row['birads_label']),
+            'true_binary_label': true_binary,
+            'predicted_birads': int(cls.predicted_birads),
+            'predicted_binary_label': pred_binary,
+            'predicted_binary_name': LABEL_NAMES[pred_binary],
+            'classifier_source': cls.source,
+            'cc_seg_dice_vs_roi': dice_score(cc_seg.mask, cc_gt_mask),
+            'cc_seg_iou_vs_roi': iou_score(cc_seg.mask, cc_gt_mask),
+            'cc_seg_precision_vs_roi': cc_precision,
+            'cc_seg_recall_vs_roi': cc_recall,
+            'mlo_seg_dice_vs_roi': dice_score(mlo_seg.mask, mlo_gt_mask),
+            'mlo_seg_iou_vs_roi': iou_score(mlo_seg.mask, mlo_gt_mask),
+            'mlo_seg_precision_vs_roi': mlo_precision,
+            'mlo_seg_recall_vs_roi': mlo_recall,
+            'cc_det_seg_iou': iou_score(cc_det_mask, cc_seg.mask),
+            'mlo_det_seg_iou': iou_score(mlo_det_mask, mlo_seg.mask),
+            'cc_detection_confidence': float(cc_det.confidence),
+            'mlo_detection_confidence': float(mlo_det.confidence),
+            'correspondence_centroid_distance_px': float(correspondence.centroid_distance_px),
+            'alignment_dice_before': dice_score(cc_seg.mask, mlo_seg_resized),
+            'alignment_dice_after': dice_score(cc_seg.mask, aligned_mlo_mask),
+            'alignment_centroid_distance_before': center_distance(cc_seg.mask, mlo_seg_resized),
+            'alignment_centroid_distance_after': center_distance(cc_seg.mask, aligned_mlo_mask),
+            'ordinal_scores': json.dumps(cls.ordinal_scores),
+        }
+        per_sample.append(sample_metrics)
+
+        overlay_detection(cc_img, cc_det.bbox_xywh, output_dir / 'detection' / f'{sample_id}_CC_detection.png')
+        overlay_detection(mlo_img, mlo_det.bbox_xywh, output_dir / 'detection' / f'{sample_id}_MLO_detection.png')
+        overlay_segmentation(cc_img, cc_seg.mask, output_dir / 'segmentation' / f'{sample_id}_CC_segmentation.png')
+        overlay_segmentation(mlo_img, mlo_seg.mask, output_dir / 'segmentation' / f'{sample_id}_MLO_segmentation.png')
+        overlay_gt_comparison(cc_img, cc_seg.mask, cc_gt_mask, output_dir / 'gt_comparison' / f'{sample_id}_CC_gt_comparison.png')
+        overlay_gt_comparison(mlo_img, mlo_seg.mask, mlo_gt_mask, output_dir / 'gt_comparison' / f'{sample_id}_MLO_gt_comparison.png')
+        save_alignment_overlay(cc_img, alignment.aligned_image, output_dir / 'alignment' / f'{sample_id}_alignment_overlay.png')
+        (output_dir / 'correspondence' / f'{sample_id}_correspondence.json').write_text(json.dumps(correspondence.to_dict(), indent=2))
+        (output_dir / 'classification' / f'{sample_id}_classification.json').write_text(
+            json.dumps(
+                {
+                    'sample_id': sample_id,
+                    'true_birads': int(row['birads_label']),
+                    'true_binary_label': true_binary,
+                    'true_binary_name': LABEL_NAMES[true_binary],
+                    'predicted_birads': int(cls.predicted_birads),
+                    'predicted_binary_label': pred_binary,
+                    'predicted_binary_name': LABEL_NAMES[pred_binary],
+                    'ordinal_scores': cls.ordinal_scores,
+                    'source': cls.source,
+                },
+                indent=2,
+            )
+        )
+
+    per_sample_df = pd.DataFrame(per_sample)
+    per_sample_df.to_csv(output_dir / 'metrics' / 'per_sample_metrics.csv', index=False)
+
+    cls_metrics = compute_binary_classification_metrics(y_true, y_pred)
+    aggregate = {
+        'dataset_base': str(dataset_base),
+        'classification_target': 'binary_birads_0_3_vs_4_5',
+        'classification_report': cls_metrics,
+        'mean_cc_seg_dice_vs_roi': float(per_sample_df['cc_seg_dice_vs_roi'].mean()) if not per_sample_df.empty else None,
+        'mean_mlo_seg_dice_vs_roi': float(per_sample_df['mlo_seg_dice_vs_roi'].mean()) if not per_sample_df.empty else None,
+        'mean_cc_det_seg_iou': float(per_sample_df['cc_det_seg_iou'].mean()) if not per_sample_df.empty else None,
+        'mean_mlo_det_seg_iou': float(per_sample_df['mlo_det_seg_iou'].mean()) if not per_sample_df.empty else None,
+        'mean_alignment_dice_before': float(per_sample_df['alignment_dice_before'].mean()) if not per_sample_df.empty else None,
+        'mean_alignment_dice_after': float(per_sample_df['alignment_dice_after'].mean()) if not per_sample_df.empty else None,
+        'mean_alignment_centroid_distance_before': float(per_sample_df['alignment_centroid_distance_before'].dropna().mean()) if not per_sample_df.empty else None,
+        'mean_alignment_centroid_distance_after': float(per_sample_df['alignment_centroid_distance_after'].dropna().mean()) if not per_sample_df.empty else None,
+    }
+    (output_dir / 'metrics' / 'aggregate_metrics.json').write_text(json.dumps(aggregate, indent=2))
+    print(json.dumps(aggregate, indent=2))
+
+
+if __name__ == '__main__':
+    main()
+
+
+
+segmentation.py
+from dataclasses import dataclass
+
+import numpy as np
+from scipy.ndimage import gaussian_filter
+from skimage import measure, morphology
+
+from localizer import predict_localization
+
+
+@dataclass
+class SegmentationResult:
+    mask: np.ndarray
+    center_yx: tuple[int, int]
+    area: int
+    score: float
+
+
+def _largest_component(binary: np.ndarray, image: np.ndarray) -> tuple[np.ndarray, int, float]:
+    labels = measure.label(binary)
+    if labels.max() == 0:
+        return np.zeros_like(binary, dtype=np.uint8), 0, 0.0
+    best_mask = np.zeros_like(binary, dtype=np.uint8)
+    best_area = 0
+    best_score = -1.0
+    for region in measure.regionprops(labels, intensity_image=image):
+        if region.area < 20:
+            continue
+        score = float(region.mean_intensity * np.sqrt(region.area))
+        if score > best_score:
+            best_score = score
+            best_area = int(region.area)
+            best_mask = (labels == region.label).astype(np.uint8)
+    return best_mask, best_area, max(best_score, 0.0)
+
+
+def _heuristic_segment(image: np.ndarray, breast_mask: np.ndarray) -> SegmentationResult:
+    masked = image * breast_mask
+    smooth = gaussian_filter(masked, sigma=1.2)
+    background = gaussian_filter(masked, sigma=9.0)
+    heatmap = np.clip(smooth - background, 0.0, 1.0)
+
+    active = heatmap[breast_mask > 0]
+    if active.size == 0:
+        empty = np.zeros_like(breast_mask, dtype=np.uint8)
+        cy, cx = image.shape[0] // 2, image.shape[1] // 2
+        return SegmentationResult(empty, (cy, cx), 0, 0.0)
+
+    threshold = float(active.mean() + 0.75 * active.std())
+    binary = (heatmap > threshold) & (breast_mask > 0)
+    binary = morphology.binary_closing(binary, morphology.disk(5))
+    binary = morphology.binary_opening(binary, morphology.disk(3))
+    binary = morphology.remove_small_objects(binary, min_size=20)
+    mask, area, score = _largest_component(binary, image)
+
+    if area == 0:
+        fallback = (masked > np.quantile(active, 0.995)) & (breast_mask > 0)
+        fallback = morphology.binary_dilation(fallback, morphology.disk(4))
+        mask, area, score = _largest_component(fallback, image)
+
+    ys, xs = np.where(mask > 0)
+    if len(ys) == 0:
+        ys, xs = np.where(breast_mask > 0)
+    cy = int(np.mean(ys)) if len(ys) else image.shape[0] // 2
+    cx = int(np.mean(xs)) if len(xs) else image.shape[1] // 2
+    return SegmentationResult(mask.astype(np.uint8), (cy, cx), area, float(score))
+
+
+def segment_lesion(image: np.ndarray, breast_mask: np.ndarray) -> SegmentationResult:
+    localization = predict_localization(image, breast_mask)
+    if localization is not None and localization.binary_mask.sum() > 0:
+        mask = localization.binary_mask.astype(np.uint8)
+        ys, xs = np.where(mask > 0)
+        cy = int(np.mean(ys)) if len(ys) else image.shape[0] // 2
+        cx = int(np.mean(xs)) if len(xs) else image.shape[1] // 2
+        return SegmentationResult(mask=mask, center_yx=(cy, cx), area=int(mask.sum()), score=float(localization.confidence))
+    return _heuristic_segment(image, breast_mask)
+
+
+
+train_localizer.py
+import argparse
+import json
+import random
+from dataclasses import dataclass
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+from PIL import Image
+import torch
+import torch.nn.functional as F
+from torch import nn
+from torch.cuda.amp import GradScaler, autocast
+from torch.utils.data import DataLoader, Dataset
+
+from data import extract_breast_mask, load_grayscale_image, preprocess_mammogram
+from localizer import SmallUNet, default_localizer_checkpoint
+from run_kaggle_full_pipeline import build_kaggle_manifest, load_roi_union, resize_long_side
+
+
+@dataclass
+class SampleRecord:
+    sample_id: str
+    view: str
+    image_path: str
+    breast_side: str
+    roi_entries: str
+
+
+class ViewLocalizerDataset(Dataset):
+    def __init__(self, records: list[SampleRecord], max_long_side: int = 1536, input_size: int = 256):
+        self.records = records
+        self.max_long_side = max_long_side
+        self.input_size = input_size
+
+    def __len__(self) -> int:
+        return len(self.records)
+
+    def __getitem__(self, idx: int):
+        record = self.records[idx]
+        flip_right = record.breast_side == "RIGHT"
+        raw_orig = load_grayscale_image(record.image_path, flip_right=flip_right)
+        raw = resize_long_side(raw_orig, self.max_long_side)
+        image = preprocess_mammogram(raw)
+        breast_mask = extract_breast_mask(image)
+        gt_mask = load_roi_union(record.roi_entries, record.breast_side, raw, raw_orig.shape)
+
+        masked = image * breast_mask
+        pil = Image.fromarray(np.clip(masked * 255.0, 0, 255).astype(np.uint8))
+        img_small = np.array(pil.resize((self.input_size, self.input_size), Image.Resampling.BILINEAR), dtype=np.float32) / 255.0
+        if img_small.max() > img_small.min():
+            img_small = (img_small - img_small.min()) / (img_small.max() - img_small.min())
+        mask_small = np.array(
+            Image.fromarray((gt_mask > 0).astype(np.uint8) * 255).resize((self.input_size, self.input_size), Image.Resampling.NEAREST),
+            dtype=np.float32,
+        ) / 255.0
+        return {
+            "image": torch.from_numpy(img_small).unsqueeze(0),
+            "mask": torch.from_numpy(mask_small).unsqueeze(0),
+        }
+
+
+def dice_loss(logits: torch.Tensor, targets: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    probs = torch.sigmoid(logits)
+    dims = (1, 2, 3)
+    intersection = (probs * targets).sum(dim=dims)
+    denom = probs.sum(dim=dims) + targets.sum(dim=dims)
+    dice = (2.0 * intersection + eps) / (denom + eps)
+    return 1.0 - dice.mean()
+
+
+def build_records(manifest: pd.DataFrame) -> list[SampleRecord]:
+    records: list[SampleRecord] = []
+    for _, row in manifest.iterrows():
+        for view in ["cc", "mlo"]:
+            records.append(
+                SampleRecord(
+                    sample_id=str(row["sample_id"]),
+                    view=view.upper(),
+                    image_path=str(row[f"{view}_image_path"]),
+                    breast_side=str(row["breast_side"]).strip().upper(),
+                    roi_entries=str(row[f"{view}_roi_entries"]),
+                )
+            )
+    return records
+
+
+def split_records(records: list[SampleRecord], seed: int = 42) -> tuple[list[SampleRecord], list[SampleRecord]]:
+    grouped: dict[str, list[SampleRecord]] = {}
+    for record in records:
+        grouped.setdefault(record.sample_id, []).append(record)
+    sample_ids = sorted(grouped)
+    rng = random.Random(seed)
+    rng.shuffle(sample_ids)
+    val_count = max(1, int(round(0.1 * len(sample_ids))))
+    val_ids = set(sample_ids[:val_count])
+    train_records = [record for record in records if record.sample_id not in val_ids]
+    val_records = [record for record in records if record.sample_id in val_ids]
+    return train_records, val_records
+
+
+def evaluate(model: nn.Module, loader: DataLoader, device: torch.device) -> dict[str, float]:
+    model.eval()
+    losses = []
+    dices = []
+    bce = nn.BCEWithLogitsLoss()
+    with torch.no_grad():
+        for batch in loader:
+            images = batch["image"].to(device)
+            masks = batch["mask"].to(device)
+            logits = model(images)
+            loss = 0.5 * bce(logits, masks) + 0.5 * dice_loss(logits, masks)
+            losses.append(float(loss.item()))
+            preds = (torch.sigmoid(logits) >= 0.35).float()
+            inter = (preds * masks).sum(dim=(1, 2, 3))
+            denom = preds.sum(dim=(1, 2, 3)) + masks.sum(dim=(1, 2, 3))
+            dice = ((2.0 * inter + 1e-6) / (denom + 1e-6)).mean().item()
+            dices.append(float(dice))
+    return {
+        "loss": float(np.mean(losses)) if losses else 0.0,
+        "dice": float(np.mean(dices)) if dices else 0.0,
+    }
+
+
+def parse_args():
+    root = Path(__file__).resolve().parents[1]
+    parser = argparse.ArgumentParser(description="Train a lightweight lesion localizer on the CBIS-DDSM Kaggle manifest")
+    parser.add_argument("--dataset-base", default=str(root / "dataset" / "raw" / "cbisddsm-kaggle"))
+    parser.add_argument("--manifest-dir", default=str(Path(__file__).resolve().parent / "localizer_training_manifest"))
+    parser.add_argument("--checkpoint", default=default_localizer_checkpoint())
+    parser.add_argument("--epochs", type=int, default=4)
+    parser.add_argument("--batch-size", type=int, default=16)
+    parser.add_argument("--input-size", type=int, default=256)
+    parser.add_argument("--max-long-side", type=int, default=1536)
+    parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--seed", type=int, default=42)
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+
+    manifest_dir = Path(args.manifest_dir)
+    manifest_dir.mkdir(parents=True, exist_ok=True)
+    manifest = build_kaggle_manifest(Path(args.dataset_base), manifest_dir)
+    records = build_records(manifest)
+    train_records, val_records = split_records(records, seed=args.seed)
+
+    train_ds = ViewLocalizerDataset(train_records, max_long_side=args.max_long_side, input_size=args.input_size)
+    val_ds = ViewLocalizerDataset(val_records, max_long_side=args.max_long_side, input_size=args.input_size)
+    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, pin_memory=True)
+    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=True)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = SmallUNet().to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
+    bce = nn.BCEWithLogitsLoss()
+    scaler = GradScaler(enabled=device.type == "cuda")
+
+    best_val_dice = -1.0
+    history = []
+    checkpoint_path = Path(args.checkpoint)
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+
+    for epoch in range(args.epochs):
+        model.train()
+        train_losses = []
+        for batch in train_loader:
+            images = batch["image"].to(device, non_blocking=True)
+            masks = batch["mask"].to(device, non_blocking=True)
+            optimizer.zero_grad(set_to_none=True)
+            with autocast(enabled=device.type == "cuda"):
+                logits = model(images)
+                loss = 0.5 * bce(logits, masks) + 0.5 * dice_loss(logits, masks)
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+            train_losses.append(float(loss.item()))
+
+        val_metrics = evaluate(model, val_loader, device)
+        record = {
+            "epoch": epoch + 1,
+            "train_loss": float(np.mean(train_losses)) if train_losses else 0.0,
+            "val_loss": val_metrics["loss"],
+            "val_dice": val_metrics["dice"],
+        }
+        history.append(record)
+        print(json.dumps(record))
+
+        if val_metrics["dice"] > best_val_dice:
+            best_val_dice = val_metrics["dice"]
+            torch.save(
+                {
+                    "model_state": model.state_dict(),
+                    "history": history,
+                    "best_val_dice": best_val_dice,
+                    "input_size": args.input_size,
+                    "max_long_side": args.max_long_side,
+                },
+                checkpoint_path,
+            )
+
+    metrics_path = checkpoint_path.with_suffix('.json')
+    metrics_path.write_text(json.dumps({"history": history, "best_val_dice": best_val_dice}, indent=2))
+    print(f"saved_checkpoint={checkpoint_path}")
+    print(f"best_val_dice={best_val_dice:.4f}")
+
+
+if __name__ == "__main__":
+    main()

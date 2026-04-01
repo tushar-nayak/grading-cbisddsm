@@ -1,0 +1,72 @@
+# =========================
+# 1. Datasets & Raw Images
+# =========================
+# Ignore the massive downloaded Kaggle dataset and images
+dataset/
+cbisddsm-kaggle/
+*.jpg
+*.jpeg
+*.dcm
+*.png
+
+# =========================
+# 2. Generated Model Outputs
+# =========================
+# Ignore PyTorch tensors and model weights
+*.pt
+*.pth
+output/
+vit_attentional_weights.pth
+cnn_attentional_weights.pth
+*.pyc
+
+# =========================
+# 3. Generated Reports & Logs
+# =========================
+# Ignore script outputs, generated CSVs, and diagnostic images
+dataset_reports/
+output/diagnostics/
+*.png
+#all_python_files_contents.txt
+dicom_clean_train.csv
+saliency_metadata.json
+
+# =========================
+# 4. Python & Environment
+# =========================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environments
+venv/
+.venv/
+env/
+.env
+
+# =========================
+# 5. OS & IDE Files
+# =========================
+.DS_Store
+.vscode/
+.idea/
+*.swp
