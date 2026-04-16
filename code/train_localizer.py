@@ -16,7 +16,7 @@ from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
 from data import load_grayscale_image
-from localizer import SmallUNet, default_localizer_checkpoint
+from localizer import AttentionUNet, default_localizer_checkpoint
 from run_kaggle_full_pipeline import build_kaggle_manifest, load_roi_union
 
 import warnings
@@ -548,7 +548,7 @@ def main():
     )
 
     print("Building model...")
-    model = SmallUNet().to(device)
+    model = AttentionUNet().to(device)
     if device.type == "cuda":
         model = model.to(memory_format=torch.channels_last)
 
