@@ -7,7 +7,7 @@
     "predicted_birads": 3,
     "classifier_source": "cnn_cross_attention",
     "cc": {
-      "image_path": "/home/sofa/host_dir/spatial_alignment/dataset/raw/cbisddsm-proj/jpeg/1.3.6.1.4.1.9590.100.1.2.342386194811267636608694132590482924515/1-211.jpg",
+      "image_path": "/home/sofa/host_dir/code/spatial_alignment/dataset/raw/cbisddsm-proj/jpeg/1.3.6.1.4.1.9590.100.1.2.342386194811267636608694132590482924515/1-211.jpg",
       "bbox_xywh": [
         0,
         2477,
@@ -23,7 +23,7 @@
       "segmentation_score": 193.1020284812403
     },
     "mlo": {
-      "image_path": "/home/sofa/host_dir/spatial_alignment/dataset/raw/cbisddsm-proj/jpeg/1.3.6.1.4.1.9590.100.1.2.359308329312397897125630708681441180834/1-207.jpg",
+      "image_path": "/home/sofa/host_dir/code/spatial_alignment/dataset/raw/cbisddsm-proj/jpeg/1.3.6.1.4.1.9590.100.1.2.359308329312397897125630708681441180834/1-207.jpg",
       "bbox_xywh": [
         0,
         24,
@@ -85,7 +85,7 @@
     "predicted_birads": 4,
     "classifier_source": "cnn_cross_attention",
     "cc": {
-      "image_path": "/home/sofa/host_dir/spatial_alignment/dataset/raw/cbisddsm-proj/jpeg/1.3.6.1.4.1.9590.100.1.2.89180046211022531834352631483669346540/1-250.jpg",
+      "image_path": "/home/sofa/host_dir/code/spatial_alignment/dataset/raw/cbisddsm-proj/jpeg/1.3.6.1.4.1.9590.100.1.2.89180046211022531834352631483669346540/1-250.jpg",
       "bbox_xywh": [
         1202,
         759,
@@ -101,7 +101,7 @@
       "segmentation_score": 362.5000015371792
     },
     "mlo": {
-      "image_path": "/home/sofa/host_dir/spatial_alignment/dataset/raw/cbisddsm-proj/jpeg/1.3.6.1.4.1.9590.100.1.2.295360926313492745441868049270168300162/1-067.jpg",
+      "image_path": "/home/sofa/host_dir/code/spatial_alignment/dataset/raw/cbisddsm-proj/jpeg/1.3.6.1.4.1.9590.100.1.2.295360926313492745441868049270168300162/1-067.jpg",
       "bbox_xywh": [
         1261,
         1455,

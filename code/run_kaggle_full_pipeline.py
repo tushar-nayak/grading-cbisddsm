@@ -84,7 +84,7 @@ def default_classifier_checkpoint() -> str:
 
 
 def parse_args():
-    base_dir = Path("/home/sofa/host_dir/spatial_alignment/dataset/raw/cbisddsm-kaggle")
+    base_dir = Path("/home/sofa/host_dir/code/spatial_alignment/dataset/raw/cbisddsm-kaggle")
     parser = argparse.ArgumentParser(description="Full unified pipeline on the CBIS-DDSM Kaggle dataset")
     parser.add_argument("--dataset-base", default=str(base_dir))
     parser.add_argument("--manifest-csv", default=None)

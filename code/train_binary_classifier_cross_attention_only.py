@@ -466,11 +466,11 @@ def save_json(obj: dict, path: Path) -> None:
 
 
 def parse_args() -> argparse.Namespace:
-    base_dir = Path(__file__).resolve().parent / "birads_dataset"
+    base_dir = Path(__file__).resolve().parents[1] / "dataset" / "raw" / "cbisddsm-kaggle"
     parser = argparse.ArgumentParser(
         description="Train a binary BI-RADS classifier using ResNet50 + symmetric cross-attention on CC/MLO pairs, without segmentation or detection."
     )
-    parser.add_argument("--dataset-base", default=r"C:\Users\Roofu\Downloads\grading-cbisddsm-unified\grading-cbisddsm-unified\birads_dataset")
+    parser.add_argument("--dataset-base", default=str(base_dir))
     parser.add_argument("--manifest-csv", default=None)
     parser.add_argument("--output-dir", default=str(Path("output") / "binary_cross_attention_only"))
     parser.add_argument("--input-size", type=int, default=224)

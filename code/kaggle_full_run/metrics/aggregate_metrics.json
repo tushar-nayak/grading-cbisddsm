@@ -1,5 +1,5 @@
 {
-  "dataset_base": "/home/sofa/host_dir/spatial_alignment/dataset/raw/cbisddsm-kaggle",
+  "dataset_base": "/home/sofa/host_dir/code/spatial_alignment/dataset/raw/cbisddsm-kaggle",
   "num_samples": 2,
   "classification_accuracy": 0.5,
   "classification_f1_weighted": 0.6666666666666666,

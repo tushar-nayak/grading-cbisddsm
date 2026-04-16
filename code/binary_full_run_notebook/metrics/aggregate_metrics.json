@@ -1,5 +1,5 @@
 {
-  "dataset_base": "/home/sofa/host_dir/spatial_alignment/dataset/raw/cbisddsm-kaggle",
+  "dataset_base": "/home/sofa/host_dir/code/spatial_alignment/dataset/raw/cbisddsm-kaggle",
   "classification_target": "binary_birads_0_3_vs_4_5",
   "classification_report": {
     "labels": [

@@ -451,9 +451,10 @@ def evaluate(
 
 def parse_args():
     root = Path(__file__).resolve().parents[1]
+    base_dir = root / "dataset" / "raw" / "cbisddsm-kaggle"
     parser = argparse.ArgumentParser(description="Train a lightweight lesion localizer on the CBIS-DDSM Kaggle manifest")
 
-    parser.add_argument("--dataset-base", default=str(root / "birads_dataset"))
+    parser.add_argument("--dataset-base", default=str(base_dir))
     parser.add_argument("--manifest-dir", default=str(Path(__file__).resolve().parent / "localizer_training_manifest"))
     parser.add_argument("--checkpoint", default=default_localizer_checkpoint())
     parser.add_argument("--cache-dir", default=str(root / "output" / "localizer_cache"))

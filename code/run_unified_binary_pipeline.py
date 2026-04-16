@@ -59,7 +59,7 @@ LABEL_NAMES = {
 
 
 def parse_args():
-    base_dir = Path('/home/sofa/host_dir/spatial_alignment/dataset/raw/cbisddsm-kaggle')
+    base_dir = Path('/home/sofa/host_dir/code/spatial_alignment/dataset/raw/cbisddsm-kaggle')
     parser = argparse.ArgumentParser(
         description='Unified mammography pipeline with segmentation, detection, alignment, and binary BI-RADS classification'
     )
