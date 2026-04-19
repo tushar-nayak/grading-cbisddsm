@@ -1,0 +1,64 @@
+{
+  "dataset_base": "/home/sofa/host_dir/code/spatial_alignment/dataset/raw/cbisddsm-kaggle",
+  "num_samples": 1324,
+  "classification_accuracy": 0.3323262839879154,
+  "classification_f1_weighted": 0.33389554033035523,
+  "classification_confusion_matrix": [
+    [
+      0,
+      0,
+      11,
+      13,
+      42,
+      46
+    ],
+    [
+      0,
+      0,
+      0,
+      0,
+      0,
+      1
+    ],
+    [
+      0,
+      1,
+      50,
+      38,
+      41,
+      31
+    ],
+    [
+      0,
+      2,
+      14,
+      34,
+      57,
+      58
+    ],
+    [
+      0,
+      1,
+      70,
+      114,
+      270,
+      191
+    ],
+    [
+      0,
+      1,
+      21,
+      29,
+      102,
+      86
+    ]
+  ],
+  "mean_cc_seg_dice_vs_roi": 0.07313480903312544,
+  "mean_mlo_seg_dice_vs_roi": 0.06578584213877962,
+  "mean_cc_det_seg_iou": 0.6016504431391952,
+  "mean_mlo_det_seg_iou": 0.5968784054025101,
+  "mean_alignment_dice_before": 0.01632242174980017,
+  "mean_alignment_dice_after": 0.5723833713278058,
+  "mean_alignment_centroid_distance_before": 340.9277581303957,
+  "mean_alignment_centroid_distance_after": 1.307600625617399
+}

@@ -1,0 +1,11 @@
+{
+  "sample_id": "P_00594_LEFT",
+  "true_birads": 4,
+  "true_binary_label": 1,
+  "true_binary_name": "birads_4_5",
+  "predicted_birads": 1,
+  "predicted_binary_label": 0,
+  "predicted_binary_name": "birads_0_1_2_3",
+  "ordinal_scores": [],
+  "source": "heuristic"
+}
